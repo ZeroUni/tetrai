@@ -4,6 +4,8 @@ import numpy as np
 from pygame import Surface
 from typing import Tuple
 
+import threading
+
 # Define constants
 SCREEN_SIZE = 512
 SCREEN_WIDTH = SCREEN_SIZE # MAKE IT A SQUARE BABY
@@ -329,7 +331,7 @@ class GameState:
 class TetrisEnv:
     def __init__(self):
         pygame.init()
-        self.screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
+        self.screen = pygame.display.set_mode((int(SCREEN_WIDTH), int(SCREEN_HEIGHT)))
         pygame.display.set_caption('TetrisEnv')
         self.clock = pygame.time.Clock()
         self.game_state = GameState()
@@ -337,6 +339,11 @@ class TetrisEnv:
         self.fall_speed = 0.5  # Seconds per fall
         self.last_move_time = pygame.time.get_ticks()
         self.render_mode = False  # Set to False to run without rendering
+        self.render_delay = 100  # Delay between renders in milliseconds
+        self.manual = False
+        self.last_render_time = pygame.time.get_ticks()
+
+        self.lock = threading.Lock()
 
         # Calculate board display area
         self.board_display_width = BOARD_WIDTH * BLOCK_SIZE
@@ -352,29 +359,32 @@ class TetrisEnv:
 
 
     def reset(self) -> np.ndarray:
-        self.game_state = GameState()
-        self.fall_time = 0
-        self.last_move_time = pygame.time.get_ticks()
-        return self.get_state()
+        with self.lock:
+            self.game_state = GameState()
+            self.fall_time = 0
+            self.last_move_time = pygame.time.get_ticks()
+            return self.get_state()
 
     def step(self, action: int) -> Tuple[np.ndarray, float, bool]:
-        reward = 0
-        done = False
+        with self.lock:
+            reward = 0
+            done = False
 
-        # Apply action
-        self.apply_action(action)
+            # Apply action
+            self.apply_action(action)
 
-        # Update game state
-        self.update_game_state()
+            # Update game state
+            self.update_game_state()
 
-        # Calculate reward
-        reward += self.calculate_reward()
+            # Calculate reward
+            reward += self.calculate_reward()
 
-        if self.game_state.game_over:
-            done = True
-            reward -= 100  # Penalty for dying
+            if self.game_state.game_over:
+                done = True
+                reward -= 100  # Penalty for dying
 
-        return self.get_state(), reward, done
+            return self.get_state(), reward, done
+
 
     def apply_action(self, action: int):
         moved = False
@@ -436,7 +446,7 @@ class TetrisEnv:
                     self.game_state.is_landing = False
                     self.game_state.lock_timer = 0
 
-        if not self.render_mode:
+        if not self.render_mode or not self.manual:
             return
 
         self.render()
@@ -445,15 +455,15 @@ class TetrisEnv:
     def calculate_reward(self) -> float:
         reward = 0
         # Good rewards
-        reward += self.game_state.score * 0.1  # Scoring
+        reward += self.game_state.score * 0.3  # Scoring
         reward += self.game_state.lines_cleared * 10  # Line clears
         # Add more rewards for complex moves if implemented
 
         # Bad rewards
         height = self.get_board_height()
-        reward -= height * 0.5  # Penalize high stacks
+        reward -= height * 0.2  # Penalize high stacks
         holes = self.count_holes()
-        reward -= holes * 1  # Penalize holes
+        reward -= holes * 3  # Penalize holes
 
         return reward
 
@@ -476,7 +486,7 @@ class TetrisEnv:
 
     def get_state(self) -> np.ndarray:
         # Render the board to a surface
-        board_surface = Surface(SCREEN_WIDTH, SCREEN_HEIGHT)
+        board_surface = Surface((SCREEN_WIDTH, SCREEN_HEIGHT))
         board_surface.fill(BLACK)
 
         # Draw game board in center, slightly above the bottom, with grid pattern
@@ -535,72 +545,79 @@ class TetrisEnv:
         # Convert the surface to a numpy array
         raw_str = pygame.image.tostring(board_surface, 'RGB')
         image = np.frombuffer(raw_str, dtype=np.uint8)
-        image = image.reshape((BOARD_HEIGHT * BLOCK_SIZE, BOARD_WIDTH * BLOCK_SIZE, 3))
+        image = image.reshape((SCREEN_HEIGHT, SCREEN_WIDTH, 3))
         image = np.mean(image, axis=2)  # Convert to grayscale
         image = image.astype(np.uint8)
+
+        # If the render mode is also enabled, render the image to the screen at a set interval
+        if self.render_mode and pygame.time.get_ticks() - self.last_render_time > self.render_delay:
+            self.screen.blit(board_surface, (0, 0))
+            pygame.display.flip()
+            self.last_render_time = pygame.time.get_ticks()
 
         return image
 
     def render(self):
-        self.screen.fill(BLACK)
+        with self.lock:
+            self.screen.fill(BLACK)
 
-        # Draw game board in center, slightly above the bottom, with grid pattern
-        for y in range(BOARD_HEIGHT):
-            for x in range(BOARD_WIDTH):
-                rect = pygame.Rect(self.board_x + x * BLOCK_SIZE, self.board_y + y * BLOCK_SIZE , BLOCK_SIZE, BLOCK_SIZE)
-                pygame.draw.rect(self.screen, (40, 40, 40), rect, 1)
-                if self.game_state.board[y][x]:
-                    pygame.draw.rect(self.screen, COLORS[self.game_state.board[y][x]], rect)
-                    pygame.draw.rect(self.screen, SECONDARY_COLORS[self.game_state.board[y][x]], 
-                                        (self.board_x + x * BLOCK_SIZE + 2, self.board_y + y * BLOCK_SIZE + 2, BLOCK_SIZE - 4, BLOCK_SIZE - 4))
+            # Draw game board in center, slightly above the bottom, with grid pattern
+            for y in range(BOARD_HEIGHT):
+                for x in range(BOARD_WIDTH):
+                    rect = pygame.Rect(self.board_x + x * BLOCK_SIZE, self.board_y + y * BLOCK_SIZE , BLOCK_SIZE, BLOCK_SIZE)
+                    pygame.draw.rect(self.screen, (40, 40, 40), rect, 1)
+                    if self.game_state.board[y][x]:
+                        pygame.draw.rect(self.screen, COLORS[self.game_state.board[y][x]], rect)
+                        pygame.draw.rect(self.screen, SECONDARY_COLORS[self.game_state.board[y][x]], 
+                                            (self.board_x + x * BLOCK_SIZE + 2, self.board_y + y * BLOCK_SIZE + 2, BLOCK_SIZE - 4, BLOCK_SIZE - 4))
 
-        # Draw current piece
-        shape = self.game_state.current_piece['shape'][self.game_state.rotation_index]
-        border_color = COLORS[PIECE_IDS[self.game_state.current_piece['type']]]
-        color = SECONDARY_COLORS[PIECE_IDS[self.game_state.current_piece['type']]]
-        for y, row in enumerate(shape):
-            for x, cell in enumerate(row):
-                if cell:
-                    px = self.board_x + (self.game_state.position[1] + x) * BLOCK_SIZE
-                    py = self.board_y + (self.game_state.position[0] + y) * BLOCK_SIZE
-                    if py >= self.board_y:
-                        border = pygame.Rect(px, py, BLOCK_SIZE, BLOCK_SIZE)
-                        pygame.draw.rect(self.screen, border_color, border)
+            # Draw current piece
+            shape = self.game_state.current_piece['shape'][self.game_state.rotation_index]
+            border_color = COLORS[PIECE_IDS[self.game_state.current_piece['type']]]
+            color = SECONDARY_COLORS[PIECE_IDS[self.game_state.current_piece['type']]]
+            for y, row in enumerate(shape):
+                for x, cell in enumerate(row):
+                    if cell:
+                        px = self.board_x + (self.game_state.position[1] + x) * BLOCK_SIZE
+                        py = self.board_y + (self.game_state.position[0] + y) * BLOCK_SIZE
+                        if py >= self.board_y:
+                            border = pygame.Rect(px, py, BLOCK_SIZE, BLOCK_SIZE)
+                            pygame.draw.rect(self.screen, border_color, border)
 
-                        rect = pygame.Rect(px + 2, py + 2, BLOCK_SIZE - 4, BLOCK_SIZE - 4)
-                        pygame.draw.rect(self.screen, color, rect)
+                            rect = pygame.Rect(px + 2, py + 2, BLOCK_SIZE - 4, BLOCK_SIZE - 4)
+                            pygame.draw.rect(self.screen, color, rect)
 
-        # Draw side panel background
-        side_panel_rect = pygame.Rect(
-            self.side_panel_x_left - self.side_panel_width_left,
-            self.board_y + 35,
-            self.side_panel_width_left,
-            140
-        )
-        
-        pygame.draw.rect(self.screen, (30, 30, 30), side_panel_rect)
+            # Draw side panel background
+            side_panel_rect = pygame.Rect(
+                self.side_panel_x_left - self.side_panel_width_left,
+                self.board_y + 35,
+                self.side_panel_width_left,
+                140
+            )
+            
+            pygame.draw.rect(self.screen, (30, 30, 30), side_panel_rect)
 
-        # Draw "Score" label
-        self.draw_text(f"Score: {self.game_state.score}", (self.side_panel_x_left - self.side_panel_width_left, self.board_y + 5), self.screen)
+            # Draw "Score" label
+            self.draw_text(f"Score: {self.game_state.score}", (self.side_panel_x_left - self.side_panel_width_left, self.board_y + 5), self.screen)
 
-        # Draw "Hold" label
-        self.draw_text("Held:", (self.side_panel_x_left - self.side_panel_width_left + 10, self.board_y + 40), self.screen)
+            # Draw "Hold" label
+            self.draw_text("Held:", (self.side_panel_x_left - self.side_panel_width_left + 10, self.board_y + 40), self.screen)
 
-        # Draw held piece
-        if self.game_state.hold_piece:
-            self.draw_small_piece(self.game_state.hold_piece, (self.side_panel_x_left - self.side_panel_width_left + 50, self.board_y + 110), self.screen)
+            # Draw held piece
+            if self.game_state.hold_piece:
+                self.draw_small_piece(self.game_state.hold_piece, (self.side_panel_x_left - self.side_panel_width_left + 50, self.board_y + 110), self.screen)
 
-        # Draw a little box around the hold piece
-        pygame.draw.rect(self.screen, WHITE, (self.side_panel_x_left - self.side_panel_width_left + 10, self.board_y + 80, 4 * BLOCK_SIZE, 4 * BLOCK_SIZE), 1)
+            # Draw a little box around the hold piece
+            pygame.draw.rect(self.screen, WHITE, (self.side_panel_x_left - self.side_panel_width_left + 10, self.board_y + 80, 4 * BLOCK_SIZE, 4 * BLOCK_SIZE), 1)
 
-        # Draw "Next" label
-        self.draw_text("Next", (self.side_panel_x_right + 20, self.board_y + 5), self.screen)
+            # Draw "Next" label
+            self.draw_text("Next", (self.side_panel_x_right + 20, self.board_y + 5), self.screen)
 
-        # Draw next five pieces
-        for i, piece in enumerate(self.game_state.next_pieces[:5]):
-            self.draw_small_piece(piece, (self.side_panel_x_right + 40, self.board_y + 65 + i * 60), self.screen)
+            # Draw next five pieces
+            for i, piece in enumerate(self.game_state.next_pieces[:5]):
+                self.draw_small_piece(piece, (self.side_panel_x_right + 40, self.board_y + 65 + i * 60), self.screen)
 
-        pygame.display.flip()
+            pygame.display.flip()
 
     def draw_small_piece(self, piece, center, surface):
         type = piece['type']
