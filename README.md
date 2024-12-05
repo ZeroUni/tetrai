@@ -18,5 +18,8 @@ graph TD;
     style E fill:#fff7a3,stroke:#333,stroke-width:2px;
     style F fill:#ffb7ce,stroke:#333,stroke-width:2px;
     style G fill:#cfd8dc,stroke:#333,stroke-width:2px;
+
+    classDef textColor fill:#000,stroke:#333,stroke-width:3px,color:#000;
+    class A,B,C,D,E,F,G textColor;
 ```
 
