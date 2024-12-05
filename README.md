@@ -11,12 +11,12 @@ graph TD;
     E -->|Iteration| F[Repeat until the CNN can play the game];
     F -->|Success| G[Profit];
     
-    style A fill:#f9f,stroke:#333,stroke-width:2px;
-    style B fill:#bbf,stroke:#333,stroke-width:2px;
-    style C fill:#f9f,stroke:#333,stroke-width:2px;
-    style D fill:#bbf,stroke:#333,stroke-width:2px;
-    style E fill:#f9f,stroke:#333,stroke-width:2px;
-    style F fill:#bbf,stroke:#333,stroke-width:2px;
-    style G fill:#f9f,stroke:#333,stroke-width:2px;
+    style A fill:#a2d5f2,stroke:#333,stroke-width:2px;
+    style B fill:#a8e6cf,stroke:#333,stroke-width:2px;
+    style C fill:#ffd3b6,stroke:#333,stroke-width:2px;
+    style D fill:#d7aefb,stroke:#333,stroke-width:2px;
+    style E fill:#fff7a3,stroke:#333,stroke-width:2px;
+    style F fill:#ffb7ce,stroke:#333,stroke-width:2px;
+    style G fill:#cfd8dc,stroke:#333,stroke-width:2px;
 ```
 
