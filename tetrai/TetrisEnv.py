@@ -5,6 +5,7 @@ from pygame import Surface
 from typing import Tuple
 
 import threading
+import multiprocessing
 
 # Define constants
 SCREEN_SIZE = 512
@@ -329,7 +330,7 @@ class GameState:
             self.board = np.vstack([np.zeros(BOARD_WIDTH, dtype=int), self.board])
 
 class TetrisEnv:
-    def __init__(self):
+    def __init__(self, render_queue=None):
         pygame.init()
         self.screen = pygame.display.set_mode((int(SCREEN_WIDTH), int(SCREEN_HEIGHT)))
         pygame.display.set_caption('TetrisEnv')
@@ -344,6 +345,7 @@ class TetrisEnv:
         self.last_render_time = pygame.time.get_ticks()
 
         self.lock = threading.Lock()
+        self.render_queue = render_queue
 
         # Calculate board display area
         self.board_display_width = BOARD_WIDTH * BLOCK_SIZE
@@ -546,14 +548,11 @@ class TetrisEnv:
         raw_str = pygame.image.tostring(board_surface, 'RGB')
         image = np.frombuffer(raw_str, dtype=np.uint8)
         image = image.reshape((SCREEN_HEIGHT, SCREEN_WIDTH, 3))
+        if self.render_queue:
+            self.render_queue.put(image)
+
         image = np.mean(image, axis=2)  # Convert to grayscale
         image = image.astype(np.uint8)
-
-        # If the render mode is also enabled, render the image to the screen at a set interval
-        if self.render_mode and pygame.time.get_ticks() - self.last_render_time > self.render_delay:
-            self.screen.blit(board_surface, (0, 0))
-            pygame.display.flip()
-            self.last_render_time = pygame.time.get_ticks()
 
         return image
 
