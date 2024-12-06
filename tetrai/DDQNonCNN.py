@@ -5,11 +5,16 @@ import torch.nn.functional as F
 
 import torchvision.transforms as transforms
 
+import argparse
+
 from collections import namedtuple, deque
+import traceback
 
 import numpy as np
 
 from PIL import Image
+import time
+import os
 
 import threading
 import multiprocessing
@@ -67,7 +72,7 @@ def preprocess_state(state, frame_stack=None):
     processed = preprocess(state)
     if frame_stack:
         return frame_stack(processed)
-    return processed
+    return processed.float()
 
 def render_thread(env):
     while True:
@@ -75,6 +80,10 @@ def render_thread(env):
         pygame.time.wait(env.render_delay)
 
 def display_images(render_queue):
+    # Create the display window
+    cv2.namedWindow('Tetris', cv2.WINDOW_NORMAL)
+    cv2.resizeWindow('Tetris', 512, 512)
+
     while True:
         image = render_queue.get()
         if image is None:
@@ -89,16 +98,33 @@ def display_images(render_queue):
 def main():
     # Define Hyperparameters
     try:
-        num_actions = 9 # Nothing, rotate left / right, move up / down / left / right, place down, hold
-        batch_size = 32
-        gamma = 0.99
-        epsilon_start = 1.0
-        epsilon_decay = 5000
-        epsilon_end = 0.1
-        target_update = 10
-        memory_capacity = 10000
-        num_episodes = 1000
-        learning_rate = 1e-4
+        parser = argparse.ArgumentParser(description='Train DDQN on Tetris')
+        parser.add_argument('--resume', type=bool, default=None)
+        parser.add_argument('--num_episodes', type=int, default=1000)
+        parser.add_argument('--batch_size', type=int, default=128)
+        parser.add_argument('--gamma', type=float, default=0.99)
+        parser.add_argument('--target_update', type=int, default=10)
+        parser.add_argument('--memory_capacity', type=int, default=10000)
+        parser.add_argument('--learning_rate', type=float, default=1e-4)
+        parser.add_argument('--policy_net', type=str, default='tetris_policy_net.pth')
+        parser.add_argument('--target_net', type=str, default='tetris_target_net.pth')
+        parser.add_argument('--max_moves', type=int, default=-1)
+        parser.add_argument('--save_interval', type=int, default=500)
+
+        args = parser.parse_args()
+
+
+        num_actions = 8 # Nothing, rotate left / right, move down / left / right, place down, hold
+        batch_size = args.batch_size
+        gamma = args.gamma
+        target_update = args.target_update
+        memory_capacity = args.memory_capacity
+        num_episodes = args.num_episodes
+        learning_rate = args.learning_rate
+
+        # get a unique name for our model dir based on the time
+        model_dir = f'out/{int(time.time())}'
+        os.makedirs(model_dir, exist_ok=True)
 
         # Initialize our networks and torch optimizer
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -113,7 +139,7 @@ def main():
 
         # Get our tetris ENV (TODO)
         render_queue = multiprocessing.Queue()
-        env = TetrisEnv.TetrisEnv(render_queue)
+        env = TetrisEnv.TetrisEnv(render_queue, max_moves=args.max_moves)
         env.render_mode = False
 
         display_proc = multiprocessing.Process(target=display_images, args=(render_queue,))
@@ -122,9 +148,13 @@ def main():
         optimizer = optim.Adam(policy_net.parameters())
         memory = ReplayMemory(memory_capacity)
         frame_stack = FrameStack(stack_size=4)
-        scaler = GradScaler(init_scale=2.**16, growth_factor=2., backoff_factor=0.5, growth_interval=1000, enabled=True)
+        scaler = GradScaler()
 
         steps_done = 0
+
+        if args.resume:
+            policy_net.load_state_dict(torch.load(args.policy_net))
+            target_net.load_state_dict(torch.load(args.target_net))
 
         # Start training?
         for episode in range(num_episodes):
@@ -134,15 +164,8 @@ def main():
             done = False
 
             while not done:
-                # Select action using epsilon-greedy policy
-                epsilon = epsilon_end + (epsilon_start - epsilon_end) * \
-                        np.exp(-1. * steps_done / epsilon_decay)
-
-                if random.random() < epsilon:
-                    action = random.randrange(num_actions)
-                else:
-                    with torch.no_grad():
-                        action = policy_net(state.unsqueeze(0)).argmax(dim=1).item()
+                with torch.no_grad():
+                    action = policy_net(state.unsqueeze(0)).argmax(dim=1).item()
 
                 # Perform action
                 next_state, reward, done = env.step(action)
@@ -160,10 +183,10 @@ def main():
                     batch = Transition(*zip(*transitions))
 
                     # Prepare batches
-                    state_batch = torch.stack(batch.state)
+                    state_batch = torch.stack(batch.state).to(device)
                     action_batch = torch.tensor(batch.action, device=device).unsqueeze(1)
                     reward_batch = torch.tensor(batch.reward, device=device)
-                    next_state_batch = torch.stack(batch.next_state)
+                    next_state_batch = torch.stack(batch.next_state).to(device)
                     done_batch = torch.tensor(batch.done, device=device, dtype=torch.float)
 
                     # Double DQN: Select action using policy_net, evaluate using target_net
@@ -178,13 +201,20 @@ def main():
                         q_values = policy_net(state_batch).gather(1, action_batch).squeeze()
 
                         # Compute loss
-                        loss = F.mse_loss(q_values, expected_q_values.detach())
+                        loss = F.mse_loss(q_values.float(), expected_q_values.detach().float())
 
                     # Optimize the model
-                    scaler.scale(loss).backward()
+                    scaler.scale(loss).to(device).backward()
                     scaler.step(optimizer)
                     scaler.update()
                     optimizer.zero_grad()
+
+                    # Reset the noise in the noisy layers
+                    policy_net.reset_noise()
+                    target_net.reset_noise()
+
+
+
 
             # Update the target network
             if episode % target_update == 0:
@@ -192,17 +222,23 @@ def main():
 
             print(f"Episode {episode}: Total Reward = {total_reward}")
 
+            if episode != 0 and episode % args.save_interval == 0:
+                torch.save(policy_net.state_dict(), f'{model_dir}/tetris_policy_net_{episode}.pth')
+                torch.save(target_net.state_dict(), f'{model_dir}/tetris_target_net_{episode}.pth')
+
 
         env.close()
         render_queue.put(None)
         display_proc.join()
 
-        torch.save(policy_net.state_dict(), 'tetris_policy_net.pth')
-        torch.save(target_net.state_dict(), 'tetris_target_net.pth')
+        torch.save(policy_net.state_dict(), f'{model_dir}/tetris_policy_net_final.pth')
+        torch.save(target_net.state_dict(), f'{model_dir}/tetris_target_net_final.pth')
     except Exception as e:
         print(e)
+        traceback.print_exc()
         env.close()
         display_proc.terminate()
+        display_proc.join()
 
 
 if __name__ == "__main__":

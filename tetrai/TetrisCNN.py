@@ -59,10 +59,8 @@ class TetrisCNN(nn.Module):
         self.conv4 = nn.Conv2d(128, 128, kernel_size=3, stride=1)
         self.bn4 = nn.BatchNorm2d(128)
         # Set up connected layer
-        self.fc1 = nn.Linear(128 * 10 * 10, 512)
-        
-        # Modify our Q values for each output
-        self.fc2 = nn.Linear(512, num_actions)
+        self.fc1 = NoisyLinear(128 * 10 * 10, 512)
+        self.fc2 = NoisyLinear(512, num_actions)
 
     def forward(self, x):
         # Shape our input
@@ -77,5 +75,10 @@ class TetrisCNN(nn.Module):
         # Get our returned values from our batch
         x = self.fc2(x)
         return x
+    
+    def reset_noise(self):
+        for layer in self.children():
+            if hasattr(layer, 'reset_noise'):
+                layer.reset_noise()
 
 # Actions are: rotate right, rotate left, push up / down / left / right, force down, hold, NOTHING - 9 actions

@@ -299,12 +299,13 @@ class GameState:
         self.clear_lines()
         self.current_piece = self.next_pieces.pop(0)
         self.next_pieces.append(self.get_new_piece())
+        curr_y = self.position[0]
         self.position = [0, BOARD_WIDTH // 2 - len(self.current_piece['shape'][0]) // 2]
         self.rotation_index = 0
         if not self.valid_position():
             self.game_over = True
-        # Up the score a bit
-        self.score += 2
+        # Up the score a bit based on the y level of the piece, e.g. 20 points for dropping a piece on the bottom
+        self.score += curr_y
         self.can_hold = True
         self.is_landing = False
         self.lock_timer = 0
@@ -330,7 +331,7 @@ class GameState:
             self.board = np.vstack([np.zeros(BOARD_WIDTH, dtype=int), self.board])
 
 class TetrisEnv:
-    def __init__(self, render_queue=None):
+    def __init__(self, render_queue=None, max_moves=-1):
         pygame.init()
         self.screen = pygame.display.set_mode((int(SCREEN_WIDTH), int(SCREEN_HEIGHT)))
         pygame.display.set_caption('TetrisEnv')
@@ -346,6 +347,9 @@ class TetrisEnv:
 
         self.lock = threading.Lock()
         self.render_queue = render_queue
+
+        self.max_moves = max_moves
+        self.move_count = 0
 
         # Calculate board display area
         self.board_display_width = BOARD_WIDTH * BLOCK_SIZE
@@ -365,6 +369,7 @@ class TetrisEnv:
             self.game_state = GameState()
             self.fall_time = 0
             self.last_move_time = pygame.time.get_ticks()
+            self.move_count = 0
             return self.get_state()
 
     def step(self, action: int) -> Tuple[np.ndarray, float, bool]:
@@ -385,44 +390,45 @@ class TetrisEnv:
                 done = True
                 reward -= 100  # Penalty for dying
 
+            self.move_count += 1
+            if 0 < self.max_moves <= self.move_count:
+                done = True  # End episode due to max moves
+
             return self.get_state(), reward, done
 
 
     def apply_action(self, action: int):
         moved = False
-        if action == 0:  # Nothing
-            return
-        elif action == 1:  # Rotate Right
-            self.game_state.rotate_piece(direction=1)
-            moved = True
-        elif action == 2:  # Rotate Left
-            self.game_state.rotate_piece(direction=-1)
-            moved = True
-        elif action == 3:  # Move Up
-            if self.game_state.valid_position(adj_y=-1):
-                self.game_state.position[0] -= 1
+        match action:
+            case 0:  # Nothing
+                return
+            case 1:  # Rotate Right
+                self.game_state.rotate_piece(direction=1)
                 moved = True
-        elif action == 4:  # Move Down
-            if self.game_state.valid_position(adj_y=1):
-                self.game_state.position[0] += 1
+            case 2:  # Rotate Left
+                self.game_state.rotate_piece(direction=-1)
                 moved = True
-        elif action == 5:  # Move Left
-            if self.game_state.valid_position(adj_x=-1):
-                self.game_state.position[1] -= 1
+            case 3:  # Move Down
+                if self.game_state.valid_position(adj_y=+1):
+                    self.game_state.position[0] += 1
+                    moved = True
+            case 4:  # Move Left
+                if self.game_state.valid_position(adj_x=-1):
+                    self.game_state.position[1] -= 1
+                    moved = True
+            case 5:  # Move Right
+                if self.game_state.valid_position(adj_x=1):
+                    self.game_state.position[1] += 1
+                    moved = True
+            case 6:  # Hard Drop
+                while self.game_state.valid_position(adj_y=1):
+                    self.game_state.position[0] += 1
+                self.game_state.lock_piece()
+                self.game_state.is_landing = False
+                self.game_state.lock_timer = 0
+            case 7:  # Hold
+                self.game_state.hold_current_piece()
                 moved = True
-        elif action == 6:  # Move Right
-            if self.game_state.valid_position(adj_x=1):
-                self.game_state.position[1] += 1
-                moved = True
-        elif action == 7:  # Hard Drop
-            while self.game_state.valid_position(adj_y=1):
-                self.game_state.position[0] += 1
-            self.game_state.lock_piece()
-            self.game_state.is_landing = False
-            self.game_state.lock_timer = 0
-        elif action == 8:  # Hold
-            self.game_state.hold_current_piece()
-            moved = True
 
         if moved and self.game_state.is_landing:
             # Reset lock timer if the piece moved or rotated while landing
@@ -457,16 +463,22 @@ class TetrisEnv:
     def calculate_reward(self) -> float:
         reward = 0
         # Good rewards
-        reward += self.game_state.score * 0.3  # Scoring
-        reward += self.game_state.lines_cleared * 10  # Line clears
-        # Add more rewards for complex moves if implemented
+        reward += self.game_state.score * .4 # Scoring
+        reward += self.game_state.lines_cleared * 150  # Line clears
+        for row in range(BOARD_HEIGHT):
+            reward += self.reward_for_fill_level(row)  # Fill levels
+        # Add more rewards for complex moves eventually
 
         # Bad rewards
         height = self.get_board_height()
-        reward -= height * 0.2  # Penalize high stacks
-        holes = self.count_holes()
-        reward -= holes * 3  # Penalize holes
+        # Penalize height exponentially, but never if the height is under 3
+        if height > 3:
+            reward -= height ** 2 * 0.7
+        holes = self.count_holes_dfs(self.game_state.board)
+        reward -= holes * 50  # Penalize holes
 
+
+        #print(f"Reward breakdown: Score: {self.game_state.score * 0.3}, Lines Cleared: {self.game_state.lines_cleared * 10}, Height: {-height ** 2 * 0.3}, Holes: {-holes * 3}")
         return reward
 
     def get_board_height(self) -> int:
@@ -475,16 +487,43 @@ class TetrisEnv:
                 return BOARD_HEIGHT - y
         return 0
 
-    def count_holes(self) -> int:
-        holes = 0
+    def count_holes_dfs(self, board: np.ndarray) -> int:
+        BOARD_WIDTH, BOARD_HEIGHT = board.shape[1], board.shape[0]
+        visited = np.zeros((BOARD_HEIGHT, BOARD_WIDTH), dtype=bool)
+        stack = []
+        
+        # Determine the starting row based on pre-calculated board height
+        height = self.get_board_height()
+        start_row = max(0, BOARD_HEIGHT - height - 1)
+        
+        # Initialize stack with all empty cells in the starting row
         for x in range(BOARD_WIDTH):
-            block_found = False
-            for y in range(BOARD_HEIGHT):
-                if self.game_state.board[y][x]:
-                    block_found = True
-                elif block_found and not self.game_state.board[y][x]:
-                    holes += 1
-        return holes
+            if board[start_row][x] == 0 and not visited[start_row][x]:
+                stack.append((x, start_row))
+                visited[start_row][x] = True
+        
+        # Iterative DFS
+        while stack:
+            x, y = stack.pop()
+            for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                nx, ny = x + dx, y + dy
+                if 0 <= nx < BOARD_WIDTH and 0 <= ny < BOARD_HEIGHT:
+                    if board[ny][nx] == 0 and not visited[ny][nx]:
+                        stack.append((nx, ny))
+                        visited[ny][nx] = True
+        
+        # Count holes: empty cells not reachable from the starting row
+        holes = np.sum((board == 0) & (~visited))
+        return int(holes)
+    
+    def get_fill_level(self, row: int) -> int:
+        return sum(self.game_state.board[row] > 0)
+    
+    def reward_for_fill_level(self, row: int) -> int:
+        fill_level = self.get_fill_level(row)
+        if fill_level > 3:
+            return fill_level ** 2
+        return 0
 
     def get_state(self) -> np.ndarray:
         # Render the board to a surface
