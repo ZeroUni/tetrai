@@ -95,12 +95,12 @@ def display_images(render_queue):
             break
     cv2.destroyAllWindows()
 
-def main():
+def main(weights=None, num_episodes=1000, max_moves=-1, display_enabled=True):
     # Define Hyperparameters
     try:
         parser = argparse.ArgumentParser(description='Train DDQN on Tetris')
         parser.add_argument('--resume', type=bool, default=None)
-        parser.add_argument('--num_episodes', type=int, default=1000)
+        parser.add_argument('--num_episodes', type=int, default=num_episodes)
         parser.add_argument('--batch_size', type=int, default=128)
         parser.add_argument('--gamma', type=float, default=0.99)
         parser.add_argument('--target_update', type=int, default=10)
@@ -108,8 +108,9 @@ def main():
         parser.add_argument('--learning_rate', type=float, default=1e-4)
         parser.add_argument('--policy_net', type=str, default='tetris_policy_net.pth')
         parser.add_argument('--target_net', type=str, default='tetris_target_net.pth')
-        parser.add_argument('--max_moves', type=int, default=-1)
+        parser.add_argument('--max_moves', type=int, default=max_moves)
         parser.add_argument('--save_interval', type=int, default=500)
+        parser.add_argument('--weights', type=dict, default=weights)
 
         args = parser.parse_args()
 
@@ -139,11 +140,12 @@ def main():
 
         # Get our tetris ENV (TODO)
         render_queue = multiprocessing.Queue()
-        env = TetrisEnv.TetrisEnv(render_queue, max_moves=args.max_moves)
+        env = TetrisEnv.TetrisEnv(render_queue, max_moves=args.max_moves, weights=args.weights)
         env.render_mode = False
 
-        display_proc = multiprocessing.Process(target=display_images, args=(render_queue,))
-        display_proc.start()
+        if display_enabled:
+            display_proc = multiprocessing.Process(target=display_images, args=(render_queue,))
+            display_proc.start()
 
         optimizer = optim.Adam(policy_net.parameters())
         memory = ReplayMemory(memory_capacity)
@@ -229,7 +231,8 @@ def main():
 
         env.close()
         render_queue.put(None)
-        display_proc.join()
+        if display_enabled:
+            display_proc.join()
 
         torch.save(policy_net.state_dict(), f'{model_dir}/tetris_policy_net_final.pth')
         torch.save(target_net.state_dict(), f'{model_dir}/tetris_target_net_final.pth')
@@ -237,8 +240,9 @@ def main():
         print(e)
         traceback.print_exc()
         env.close()
-        display_proc.terminate()
-        display_proc.join()
+        if display_enabled:
+            render_queue.put(None)
+            display_proc.join()
 
 
 if __name__ == "__main__":

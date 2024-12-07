@@ -7,6 +7,11 @@ from typing import Tuple
 import threading
 import multiprocessing
 
+import torch
+import cupy as cp
+from numba import jit, cuda
+from functools import lru_cache
+
 # Define constants
 SCREEN_SIZE = 512
 SCREEN_WIDTH = SCREEN_SIZE # MAKE IT A SQUARE BABY
@@ -223,7 +228,11 @@ WALL_KICKS = {
 
 class GameState:
     def __init__(self):
-        self.board = np.zeros((BOARD_HEIGHT, BOARD_WIDTH), dtype=int)
+        self.board = torch.zeros((BOARD_HEIGHT, BOARD_WIDTH), 
+                               dtype=torch.int8,
+                               device='cuda')
+        self.temp_board = torch.zeros_like(self.board)
+        self.visited = torch.zeros_like(self.board, dtype=torch.bool)
         self.current_piece = self.get_new_piece()
         self.next_pieces = [self.get_new_piece() for _ in range(5)]
         self.hold_piece = None
@@ -236,6 +245,13 @@ class GameState:
         self.lock_delay = 500  # Lock delay in milliseconds
         self.lock_timer = 0
         self.is_landing = False
+        self.actions_per_piece = 0
+
+        # Cache piece matrices as tensors
+        self.piece_tensors = {
+            piece_type: torch.tensor(shapes, device='cuda', dtype=torch.int8)
+            for piece_type, shapes in SHAPES.items()
+        }
 
     def get_new_piece(self):
         shape_type = random.choice(list(SHAPES.keys()))
@@ -260,6 +276,20 @@ class GameState:
         # Revert rotation if all kicks fail
         self.rotation_index = old_rotation
 
+    @staticmethod
+    @jit(nopython=True, parallel=True)
+    def count_holes_fast(board):
+        """Optimized hole counting using Numba"""
+        holes = 0
+        for col in range(board.shape[1]):
+            block_found = False
+            for row in range(board.shape[0]):
+                if board[row,col] != 0:
+                    block_found = True
+                elif block_found:
+                    holes += 1
+        return holes
+
     def hold_current_piece(self):
         if self.can_hold:
             if self.hold_piece is None:
@@ -272,19 +302,39 @@ class GameState:
             self.rotation_index = 0
             self.can_hold = False
 
+    @torch.jit.script
     def valid_position(self, piece=None, adj_x=0, adj_y=0):
+        """Optimized collision detection with GPU tensors
+        
+        Args:
+            piece: Optional piece matrix. Uses current piece if None
+            adj_x: X position adjustment
+            adj_y: Y position adjustment
+            
+        Returns:
+            bool: True if position is valid
+        """
         if piece is None:
             piece = self.current_piece['shape'][self.rotation_index]
-        for y, row in enumerate(piece):
-            for x, cell in enumerate(row):
-                if cell:
-                    new_x = self.position[1] + x + adj_x
-                    new_y = self.position[0] + y + adj_y
-                    if new_x < 0 or new_x >= BOARD_WIDTH or new_y >= BOARD_HEIGHT:
-                        return False
-                    if new_y >= 0 and self.board[new_y][new_x]:
-                        return False
-        return True
+        piece = torch.tensor(piece, device='cuda', dtype=torch.int8)
+        
+        # Calculate new position
+        new_x = self.position[1] + adj_x 
+        new_y = self.position[0] + adj_y
+
+        # Bounds check
+        if (new_x < 0 or 
+            new_x + piece.shape[1] > BOARD_WIDTH or 
+            new_y + piece.shape[0] > BOARD_HEIGHT):
+            return False
+            
+        if new_y < 0:
+            return True  # Allow piece to be partially above board
+        
+        # Check collision with board using GPU
+        piece_area = self.board[new_y:new_y + piece.shape[0],
+                            new_x:new_x + piece.shape[1]]
+        return not torch.any(piece_area & piece)
 
     def lock_piece(self):
         self.can_hold = False
@@ -309,31 +359,69 @@ class GameState:
         self.can_hold = True
         self.is_landing = False
         self.lock_timer = 0
+        self.actions_per_piece = 0
 
+    @torch.jit.script
     def clear_lines(self):
+        """Clear full lines using GPU operations
+        
+        Returns:
+            int: Number of lines cleared
+        """
+        # Find full lines using GPU
+        full_lines = torch.all(self.board != 0, dim=1)
+        num_cleared = int(torch.sum(full_lines).item())
+        
+        if num_cleared == 0:
+            return 0
+            
+        # Remove full lines
+        keep_lines = ~full_lines
+        self.board = self.board[keep_lines]
+        
+        # Add new empty lines on top
+        empty_lines = torch.zeros((num_cleared, BOARD_WIDTH), 
+                                dtype=torch.int8,
+                                device='cuda')
+        self.board = torch.cat([empty_lines, self.board])
+        
+        # Update score
         lines_before = self.lines_cleared
-        self.board = np.array([row for row in self.board if not all(row)])
-        cleared = BOARD_HEIGHT - len(self.board)
-        self.lines_cleared += cleared
-        match cleared:
-            case 1:
-                self.score += 40
-            case 2:
-                self.score += 100
-            case 3:
-                self.score += 300
-            case 4:
-                self.score += 1200
+        self.lines_cleared += num_cleared
+        
+        # Score calculation
+        match num_cleared:
+            case 1: self.score += 40
+            case 2: self.score += 500
+            case 3: self.score += 1200
+            case 4: self.score += 2800
+        
+        # Level up bonus
         if self.lines_cleared >= 10 * (lines_before // 10 + 1):
             self.score += 1000
-        # Add empty rows on top
-        while len(self.board) < BOARD_HEIGHT:
-            self.board = np.vstack([np.zeros(BOARD_WIDTH, dtype=int), self.board])
+            
+        return num_cleared
 
 class TetrisEnv:
-    def __init__(self, render_queue=None, max_moves=-1):
-        pygame.init()
-        self.screen = pygame.display.set_mode((int(SCREEN_WIDTH), int(SCREEN_HEIGHT)))
+    def __init__(self, render_queue=None, max_moves=-1, weights=None, manual=False):
+        # Pre-allocate surfaces for rendering
+        self.board_surface = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT))
+        self.piece_surface = pygame.Surface((BLOCK_SIZE * 4, BLOCK_SIZE * 4))
+
+        # Use GPU tensors for state processing
+        self.state_processor = torch.nn.Sequential(
+            torch.nn.Conv2d(1, 1, 3, padding=1),
+            torch.nn.ReLU()
+        ).cuda()
+
+        if not pygame.get_init():
+            pygame.init()
+        
+        self.manual = manual
+        if self.manual:
+            self.screen = pygame.display.set_mode((int(SCREEN_WIDTH), int(SCREEN_HEIGHT)))
+        else:
+            self.screen = None
         pygame.display.set_caption('TetrisEnv')
         self.clock = pygame.time.Clock()
         self.game_state = GameState()
@@ -342,7 +430,6 @@ class TetrisEnv:
         self.last_move_time = pygame.time.get_ticks()
         self.render_mode = False  # Set to False to run without rendering
         self.render_delay = 100  # Delay between renders in milliseconds
-        self.manual = False
         self.last_render_time = pygame.time.get_ticks()
 
         self.lock = threading.Lock()
@@ -350,6 +437,8 @@ class TetrisEnv:
 
         self.max_moves = max_moves
         self.move_count = 0
+
+        self.weights = weights or {}
 
         # Calculate board display area
         self.board_display_width = BOARD_WIDTH * BLOCK_SIZE
@@ -388,7 +477,7 @@ class TetrisEnv:
 
             if self.game_state.game_over:
                 done = True
-                reward -= 100  # Penalty for dying
+                reward -= self.weights.get('game_over') or 1000  # Penalty for dying
 
             self.move_count += 1
             if 0 < self.max_moves <= self.move_count:
@@ -399,8 +488,10 @@ class TetrisEnv:
 
     def apply_action(self, action: int):
         moved = False
+        self.game_state.actions_per_piece += 1
         match action:
             case 0:  # Nothing
+                self.game_state.actions_per_piece -= 1
                 return
             case 1:  # Rotate Right
                 self.game_state.rotate_piece(direction=1)
@@ -412,6 +503,7 @@ class TetrisEnv:
                 if self.game_state.valid_position(adj_y=+1):
                     self.game_state.position[0] += 1
                     moved = True
+                self.game_state.actions_per_piece -= 1
             case 4:  # Move Left
                 if self.game_state.valid_position(adj_x=-1):
                     self.game_state.position[1] -= 1
@@ -426,9 +518,11 @@ class TetrisEnv:
                 self.game_state.lock_piece()
                 self.game_state.is_landing = False
                 self.game_state.lock_timer = 0
+                self.game_state.actions_per_piece -= 1
             case 7:  # Hold
                 self.game_state.hold_current_piece()
                 moved = True
+                self.game_state.actions_per_piece -= 1
 
         if moved and self.game_state.is_landing:
             # Reset lock timer if the piece moved or rotated while landing
@@ -460,32 +554,79 @@ class TetrisEnv:
         self.render()
         self.clock.tick(60)
 
+    # def calculate_reward(self) -> float:
+    #     reward = 0
+    #     # Good rewards
+    #     reward += self.game_state.score * (self.weights.get('score') or .4)  # Scoring
+    #     reward += self.game_state.lines_cleared * (self.weights.get('lines_cleared') or 300)  # Line clears
+    #     for row in range(BOARD_HEIGHT):
+    #         reward += self.reward_for_fill_level(row) * (self.weights.get('fill_level') or .4)  # Fill levels
+    #     # Add more rewards for complex moves eventually
+
+    #     # Bad rewards
+    #     height = self.get_board_height()
+    #     # Penalize height exponentially, but never if the height is under 3
+    #     if height > 3:
+    #         reward -= height ** 1.4 * (self.weights.get('height') or .4)
+    #     holes = self.count_holes_dfs(self.game_state.board)
+    #     reward -= holes * (self.weights.get('holes') or 50)  # Penalize holes
+    #     # Penalize for using too many actions per piece
+    #     if self.game_state.actions_per_piece > 5:
+    #         reward -= self.game_state.actions_per_piece * (self.weights.get('actions_per_piece') or 1.5)
+    #     # Penalize for bumpiness
+    #     bumpiness = self.calculate_bumpiness() * (self.weights.get('actions_per_piece') or 1.5)
+    #     reward -= bumpiness
+
+    #     # Scale the absolute value of the reward to its logarithmic value to avoid excessing rewards or punishments
+    #     reward = np.sign(reward) * np.log1p(abs(reward))
+
+    #     return reward
+
+    @torch.jit.script
     def calculate_reward(self) -> float:
-        reward = 0
+        """Calculate reward using GPU operations
+        
+        Returns:
+            float: Calculated reward value
+        """
+        reward = 0.0
+        
         # Good rewards
-        reward += self.game_state.score * .4 # Scoring
-        reward += self.game_state.lines_cleared * 150  # Line clears
-        for row in range(BOARD_HEIGHT):
-            reward += self.reward_for_fill_level(row)  # Fill levels
-        # Add more rewards for complex moves eventually
+        reward += self.game_state.score * (self.weights.get('score', 0.4))
+        reward += self.game_state.lines_cleared * (self.weights.get('lines_cleared', 300.0))
+        
+        # Column heights
+        heights = torch.argmax(self.game_state.board != 0, dim=0)
+        max_height = BOARD_HEIGHT - torch.min(heights).item()
+        
+        # Penalize height if too high
+        if max_height > 3:
+            reward -= (max_height ** 1.4) * (self.weights.get('height', 0.4))
+        
+        # Holes penalty
+        holes = self.count_holes()
+        reward -= holes * (self.weights.get('holes', 50.0))
+        
+        # Bumpiness penalty 
+        bumpiness = float(torch.sum(torch.abs(heights[:-1] - heights[1:])).item())
+        reward -= bumpiness * (self.weights.get('bumpiness', 1.5))
+        
+        # Action penalty
+        if self.game_state.actions_per_piece > 5:
+            reward -= self.game_state.actions_per_piece * (self.weights.get('actions_per_piece', 1.5))
+        
+        # Log scale to avoid extreme values
+        return float(torch.sign(torch.tensor(reward)) * torch.log1p(torch.abs(torch.tensor(reward))))
 
-        # Bad rewards
-        height = self.get_board_height()
-        # Penalize height exponentially, but never if the height is under 3
-        if height > 3:
-            reward -= height ** 2 * 0.7
-        holes = self.count_holes_dfs(self.game_state.board)
-        reward -= holes * 50  # Penalize holes
-
-
-        #print(f"Reward breakdown: Score: {self.game_state.score * 0.3}, Lines Cleared: {self.game_state.lines_cleared * 10}, Height: {-height ** 2 * 0.3}, Holes: {-holes * 3}")
-        return reward
-
+    @lru_cache(maxsize=1)
     def get_board_height(self) -> int:
-        for y in range(BOARD_HEIGHT):
-            if any(self.game_state.board[y]):
-                return BOARD_HEIGHT - y
-        return 0
+        """Get current board height with caching
+        
+        Returns:
+            int: Height of highest block
+        """
+        heights = torch.argmax(self.board != 0, dim=0)
+        return int(BOARD_HEIGHT - torch.min(heights).item())
 
     def count_holes_dfs(self, board: np.ndarray) -> int:
         BOARD_WIDTH, BOARD_HEIGHT = board.shape[1], board.shape[0]
@@ -515,6 +656,27 @@ class TetrisEnv:
         # Count holes: empty cells not reachable from the starting row
         holes = np.sum((board == 0) & (~visited))
         return int(holes)
+
+    @torch.jit.script
+    def count_holes(self):
+        """Count holes using GPU operations
+        
+        Returns:
+            int: Number of holes in board
+        """
+        # Find highest block in each column
+        heights = torch.argmax(self.board != 0, dim=0)
+        
+        # Create mask of positions that should be filled
+        rows = torch.arange(BOARD_HEIGHT, device='cuda')[:, None]
+        cols = torch.arange(BOARD_WIDTH, device='cuda')[None, :]
+        should_be_filled = rows >= heights
+        
+        # Count empty cells below heights
+        is_empty = (self.board == 0)
+        holes = torch.sum(should_be_filled & is_empty).item()
+        
+        return int(holes)
     
     def get_fill_level(self, row: int) -> int:
         return sum(self.game_state.board[row] > 0)
@@ -524,76 +686,99 @@ class TetrisEnv:
         if fill_level > 3:
             return fill_level ** 2
         return 0
+    
+    def calculate_bumpiness(self):
+        heights = [BOARD_HEIGHT - np.argmax(self.game_state.board[:, x]) if np.any(self.game_state.board[:, x]) else 0 for x in range(BOARD_WIDTH)]
+        bumpiness = sum(abs(heights[i] - heights[i+1]) for i in range(len(heights)-1))
+        return bumpiness
 
-    def get_state(self) -> np.ndarray:
-        # Render the board to a surface
-        board_surface = Surface((SCREEN_WIDTH, SCREEN_HEIGHT))
-        board_surface.fill(BLACK)
+    # def get_state(self) -> np.ndarray:
+    #     # Render the board to a surface
+    #     board_surface = Surface((SCREEN_WIDTH, SCREEN_HEIGHT))
+    #     board_surface.fill(BLACK)
 
-        # Draw game board in center, slightly above the bottom, with grid pattern
-        for y in range(BOARD_HEIGHT):
-            for x in range(BOARD_WIDTH):
-                rect = pygame.Rect(self.board_x + x * BLOCK_SIZE, self.board_y + y * BLOCK_SIZE , BLOCK_SIZE, BLOCK_SIZE)
-                pygame.draw.rect(board_surface, (40, 40, 40), rect, 1)
-                if self.game_state.board[y][x]:
-                    pygame.draw.rect(board_surface, COLORS[self.game_state.board[y][x]], rect)
-                    pygame.draw.rect(board_surface, SECONDARY_COLORS[self.game_state.board[y][x]], 
-                                        (self.board_x + x * BLOCK_SIZE + 2, self.board_y + y * BLOCK_SIZE + 2, BLOCK_SIZE - 4, BLOCK_SIZE - 4))
+    #     # Draw game board in center, slightly above the bottom, with grid pattern
+    #     for y in range(BOARD_HEIGHT):
+    #         for x in range(BOARD_WIDTH):
+    #             rect = pygame.Rect(self.board_x + x * BLOCK_SIZE, self.board_y + y * BLOCK_SIZE , BLOCK_SIZE, BLOCK_SIZE)
+    #             pygame.draw.rect(board_surface, (40, 40, 40), rect, 1)
+    #             if self.game_state.board[y][x]:
+    #                 pygame.draw.rect(board_surface, COLORS[self.game_state.board[y][x]], rect)
+    #                 pygame.draw.rect(board_surface, SECONDARY_COLORS[self.game_state.board[y][x]], 
+    #                                     (self.board_x + x * BLOCK_SIZE + 2, self.board_y + y * BLOCK_SIZE + 2, BLOCK_SIZE - 4, BLOCK_SIZE - 4))
                     
-        # Draw current piece
-        shape = self.game_state.current_piece['shape'][self.game_state.rotation_index]
-        border_color = COLORS[PIECE_IDS[self.game_state.current_piece['type']]]
-        color = SECONDARY_COLORS[PIECE_IDS[self.game_state.current_piece['type']]]
-        for y, row in enumerate(shape):
-            for x, cell in enumerate(row):
-                if cell:
-                    px = self.board_x + (self.game_state.position[1] + x) * BLOCK_SIZE
-                    py = self.board_y + (self.game_state.position[0] + y) * BLOCK_SIZE
-                    if py >= self.board_y:
-                        border = pygame.Rect(px, py, BLOCK_SIZE, BLOCK_SIZE)
-                        pygame.draw.rect(board_surface, border_color, border)
+    #     # Draw current piece
+    #     shape = self.game_state.current_piece['shape'][self.game_state.rotation_index]
+    #     border_color = COLORS[PIECE_IDS[self.game_state.current_piece['type']]]
+    #     color = SECONDARY_COLORS[PIECE_IDS[self.game_state.current_piece['type']]]
+    #     for y, row in enumerate(shape):
+    #         for x, cell in enumerate(row):
+    #             if cell:
+    #                 px = self.board_x + (self.game_state.position[1] + x) * BLOCK_SIZE
+    #                 py = self.board_y + (self.game_state.position[0] + y) * BLOCK_SIZE
+    #                 if py >= self.board_y:
+    #                     border = pygame.Rect(px, py, BLOCK_SIZE, BLOCK_SIZE)
+    #                     pygame.draw.rect(board_surface, border_color, border)
 
-                        rect = pygame.Rect(px + 2, py + 2, BLOCK_SIZE - 4, BLOCK_SIZE - 4)
-                        pygame.draw.rect(board_surface, color, rect)
+    #                     rect = pygame.Rect(px + 2, py + 2, BLOCK_SIZE - 4, BLOCK_SIZE - 4)
+    #                     pygame.draw.rect(board_surface, color, rect)
 
-        # Draw side panel background
-        side_panel_rect = pygame.Rect(
-            self.side_panel_x_left - self.side_panel_width_left,
-            self.board_y + 35,
-            self.side_panel_width_left,
-            140
-        )
+    #     # Draw side panel background
+    #     side_panel_rect = pygame.Rect(
+    #         self.side_panel_x_left - self.side_panel_width_left,
+    #         self.board_y + 35,
+    #         self.side_panel_width_left,
+    #         140
+    #     )
 
-        pygame.draw.rect(board_surface, (30, 30, 30), side_panel_rect)
+    #     pygame.draw.rect(board_surface, (30, 30, 30), side_panel_rect)
 
-        # Draw "Hold" label
-        self.draw_text("Held:", (self.side_panel_x_left - self.side_panel_width_left + 10, self.board_y + 40), board_surface)
+    #     # Draw "Hold" label
+    #     self.draw_text("Held:", (self.side_panel_x_left - self.side_panel_width_left + 10, self.board_y + 40), board_surface)
 
-        # Draw held piece
-        if self.game_state.hold_piece:
-            self.draw_small_piece(self.game_state.hold_piece, (self.side_panel_x_left - self.side_panel_width_left + 50, self.board_y + 110), board_surface)
+    #     # Draw held piece
+    #     if self.game_state.hold_piece:
+    #         self.draw_small_piece(self.game_state.hold_piece, (self.side_panel_x_left - self.side_panel_width_left + 50, self.board_y + 110), board_surface)
 
-        # Draw a little box around the hold piece
-        pygame.draw.rect(board_surface, WHITE, (self.side_panel_x_left - self.side_panel_width_left + 10, self.board_y + 80, 4 * BLOCK_SIZE, 4 * BLOCK_SIZE), 1)
+    #     # Draw a little box around the hold piece
+    #     pygame.draw.rect(board_surface, WHITE, (self.side_panel_x_left - self.side_panel_width_left + 10, self.board_y + 80, 4 * BLOCK_SIZE, 4 * BLOCK_SIZE), 1)
 
-        # Draw "Next" label
-        self.draw_text("Next", (self.side_panel_x_right + 20, self.board_y + 5), board_surface)
+    #     # Draw "Next" label
+    #     self.draw_text("Next", (self.side_panel_x_right + 20, self.board_y + 5), board_surface)
 
-        # Draw next five pieces
-        for i, piece in enumerate(self.game_state.next_pieces[:5]):
-            self.draw_small_piece(piece, (self.side_panel_x_right + 40, self.board_y + 65 + i * 60), board_surface)
+    #     # Draw next five pieces
+    #     for i, piece in enumerate(self.game_state.next_pieces[:5]):
+    #         self.draw_small_piece(piece, (self.side_panel_x_right + 40, self.board_y + 65 + i * 60), board_surface)
 
-        # Convert the surface to a numpy array
-        raw_str = pygame.image.tostring(board_surface, 'RGB')
-        image = np.frombuffer(raw_str, dtype=np.uint8)
-        image = image.reshape((SCREEN_HEIGHT, SCREEN_WIDTH, 3))
-        if self.render_queue:
-            self.render_queue.put(image)
+    #     # Convert the surface to a numpy array
+    #     raw_str = pygame.image.tostring(board_surface, 'RGB')
+    #     image = np.frombuffer(raw_str, dtype=np.uint8)
+    #     image = image.reshape((SCREEN_HEIGHT, SCREEN_WIDTH, 3))
+    #     if self.render_queue:
+    #         self.render_queue.put(image)
 
-        image = np.mean(image, axis=2)  # Convert to grayscale
-        image = image.astype(np.uint8)
+    #     image = np.mean(image, axis=2)  # Convert to grayscale
+    #     image = image.astype(np.uint8)
 
-        return image
+    #     return image
+    def get_state(self) -> np.ndarray:
+        """Get current state tensor optimized for GPU
+        
+        Returns:
+            torch.Tensor: State representation (BOARD_HEIGHT, BOARD_WIDTH)
+        """
+        # Start with board state
+        state = self.game_state.board.clone()
+        
+        # Add current piece
+        piece = torch.tensor(self.game_state.current_piece['shape'][self.game_state.rotation_index],
+                            device='cuda', dtype=torch.int8)
+        y, x = self.game_state.position
+        if y >= 0:  # Only draw piece if on board
+            h, w = piece.shape
+            state[y:y+h, x:x+w] |= piece
+            
+        return state
 
     def render(self):
         with self.lock:
