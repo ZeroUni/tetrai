@@ -23,3 +23,11 @@ graph TD;
     class A,B,C,D,E,F,G textColor;
 ```
 
+## Commands
+```bash
+python tetrai/RewardWeights.py
+```
+- Example run
+```bash
+python tetrai/DDQNonCNN.py --num_episodes 2000 --max_moves 200 --weights 'E:\CodingProjects\tetrai\tetrai\weights.json'
+```

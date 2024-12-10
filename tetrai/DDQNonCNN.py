@@ -27,8 +27,8 @@ import pygame
 import random
 
 import TetrisCNN
-
 import TetrisEnv
+from rewardNormalizer import RewardNormalizer
 
 import json
 
@@ -140,6 +140,56 @@ class PrioritizedReplayMemory(ReplayMemory):
                 p = float(priority)
             self.priorities[idx] = p + self.eps
 
+class EpisodeBuffer:
+    def __init__(self, gamma=0.99, n_step=3):
+        self.states = []
+        self.actions = []
+        self.immediate_rewards = []
+        self.next_states = []
+        self.dones = []
+        self.gamma = gamma
+        self.n_step = n_step
+        
+    def push(self, state, action, reward, next_state, done):
+        self.states.append(state)
+        self.actions.append(action)
+        self.immediate_rewards.append(reward)
+        self.next_states.append(next_state)
+        self.dones.append(done)
+    
+    def calculate_n_step_returns(self):
+        returns = []
+        for t in range(len(self.immediate_rewards)):
+            n_step_return = 0
+            for i in range(self.n_step):
+                if t + i < len(self.immediate_rewards):
+                    n_step_return += (self.gamma ** i) * self.immediate_rewards[t + i]
+            returns.append(n_step_return)
+        return returns
+    
+    def get_transitions(self, memory):
+        returns = self.calculate_n_step_returns()
+        
+        # Calculate final episode metrics
+        final_score = sum(self.immediate_rewards)
+        
+        # Apply retrospective rewards
+        for t in range(len(returns)):
+            state = self.states[t]
+            action = self.actions[t]
+            next_state = self.next_states[t]
+            done = self.dones[t]
+            
+            # Composite reward combining:
+            # - N-step return
+            # - Final episode outcome
+            reward = (
+                0.7 * returns[t] +  # n-step return
+                0.3 * final_score * (t / len(returns))  # weighted final score
+            )
+            
+            memory.push(state, action, reward, next_state, done)
+
 def preprocess_state_batch(states, frame_stack=None):
     if not isinstance(states, list):
         states = [states]
@@ -172,125 +222,183 @@ def render_thread(env):
 
 def display_images(render_queue):
     # Create the display window
-    cv2.namedWindow('Tetris', cv2.WINDOW_NORMAL)
-    cv2.resizeWindow('Tetris', 512, 512)
+    tag = os.getpid()
+    window_name = f'Tetris_{tag}'
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(window_name, 512, 512)
 
     while True:
-        image = render_queue.get()
-        if image is None:
+        try:
+            image = render_queue.get()
+            if image is None:
+                break
+            # Convert RGB to BGR for OpenCV
+            image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+            cv2.imshow(window_name, image)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+        except Exception as e:
+            print(e)
+            traceback.print_exc()
             break
-        # Convert RGB to BGR for OpenCV
-        image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
-        cv2.imshow('Tetris', image)
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
-    cv2.destroyAllWindows()
+    cv2.destroyWindow(window_name)
 
-def cleanup(env, render_queue=None, display_proc=None, display_enabled=False):
+def cleanup(env, render_queue=None, display_thr=None, display_enabled=False):
     env.close()
+    torch.cuda.synchronize()
     torch.cuda.empty_cache()
-    if display_enabled and render_queue and display_proc:
+    torch.cuda.ipc_collect()
+    if display_enabled and render_queue and display_thr:
         render_queue.put(None)
-        display_proc.join()
+        display_thr.join()
 
-def main(weights=None, num_episodes=1000, max_moves=-1, display_enabled=True):
+def main(
+    resume=False,
+    num_episodes=1000,
+    batch_size=128,
+    gamma=0.99,
+    target_update=5,
+    memory_capacity=10000,
+    learning_rate=1e-5,
+    policy_net_path='tetris_policy_net.pth',
+    target_net_path='tetris_target_net.pth',
+    max_moves=100,
+    save_interval=500,
+    weights=None,
+    display_enabled=True
+):
     # Define Hyperparameters
-    try:
-        parser = argparse.ArgumentParser(description='Train DDQN on Tetris')
-        parser.add_argument('--resume', type=bool, default=None)
-        parser.add_argument('--num_episodes', type=int, default=num_episodes)
-        parser.add_argument('--batch_size', type=int, default=128)
-        parser.add_argument('--gamma', type=float, default=0.99)
-        parser.add_argument('--target_update', type=int, default=10)
-        parser.add_argument('--memory_capacity', type=int, default=10000)
-        parser.add_argument('--learning_rate', type=float, default=1e-4)
-        parser.add_argument('--policy_net', type=str, default='tetris_policy_net.pth')
-        parser.add_argument('--target_net', type=str, default='tetris_target_net.pth')
-        parser.add_argument('--max_moves', type=int, default=max_moves)
-        parser.add_argument('--save_interval', type=int, default=500)
-        parser.add_argument('--weights', type=str, default=None)
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.deterministic = True
 
-        args = parser.parse_args()
+    compute_stream = torch.cuda.Stream()
+    memory_stream = torch.cuda.Stream()
 
-        torch.backends.cudnn.benchmark = True
-        torch.backends.cudnn.deterministic = True
+    num_actions = 8 # Nothing, rotate left / right, move down / left / right, place down, hold
 
-        compute_stream = torch.cuda.Stream()
-        memory_stream = torch.cuda.Stream()
+    # get a unique name for our model dir based on the time
+    model_dir = f'out/{int(time.time())}'
+    os.makedirs(model_dir, exist_ok=True)
 
-        num_actions = 8 # Nothing, rotate left / right, move down / left / right, place down, hold
-        batch_size = args.batch_size
-        gamma = args.gamma
-        target_update = args.target_update
-        memory_capacity = args.memory_capacity
-        num_episodes = args.num_episodes
-        learning_rate = args.learning_rate
+    # Initialize our networks and torch optimizer
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f'Using device: {device}')
+    
+    policy_net = TetrisCNN.TetrisCNN(num_actions, device=device).to(memory_format=torch.channels_last)
+    target_net = TetrisCNN.TetrisCNN(num_actions, device=device).to(memory_format=torch.channels_last)
+    target_net.load_state_dict(policy_net.state_dict())
+    target_net.eval()
 
-        # get a unique name for our model dir based on the time
-        model_dir = f'out/{int(time.time())}'
-        os.makedirs(model_dir, exist_ok=True)
-
-        # Initialize our networks and torch optimizer
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        print(f'Using device: {device}')
-        
-        policy_net = TetrisCNN.TetrisCNN(num_actions).to(device, memory_format=torch.channels_last)
-        target_net = TetrisCNN.TetrisCNN(num_actions).to(device, memory_format=torch.channels_last)
-        target_net.load_state_dict(policy_net.state_dict())
-        target_net.eval()
-        
-        if display_enabled:
-            render_queue = multiprocessing.Queue()
-            display_proc = multiprocessing.Process(target=display_images, args=(render_queue,))
-            display_proc.start()
-        else:
-            display_proc = None
-            render_queue = None
-        
-        # Load the weights from json if provided
-        if args.weights:
-            with open(args.weights, 'r') as f:
+    reward_normalizer = RewardNormalizer()
+    
+    if display_enabled:
+        render_queue = multiprocessing.Queue()
+        display_thr = threading.Thread(target=display_images, args=(render_queue,))
+        display_thr.start()
+    else:
+        display_thr = None
+        render_queue = None
+    
+    # Load the weights from json if provided
+    if weights:
+        if isinstance(weights, str): # Load from file
+            with open(weights, 'r') as f:
                 weights = json.load(f)
+        elif isinstance(weights, dict): # Use directly
+            pass
 
-        env = TetrisEnv.TetrisEnv(render_queue, max_moves=args.max_moves, weights=weights)
-        env.render_mode = False
 
-        optimizer = optim.Adam(policy_net.parameters())
-        scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=100, gamma=0.5)
-        memory = PrioritizedReplayMemory(memory_capacity)
-        frame_stack = FrameStack(stack_size=4)
-        scaler = GradScaler()
+    env = TetrisEnv.TetrisEnv(render_queue, max_moves=max_moves, weights=weights)
+    env.render_mode = False
 
-        torch.cuda.empty_cache()
-        state_batch = torch.zeros(
-            (batch_size, 4, 128, 128),
-            dtype=torch.float16,
-            device=device,
-            requires_grad=False
-        ).to(memory_format=torch.channels_last)
+    # Enhanced optimizer with weight decay
+    optimizer = optim.AdamW(
+        policy_net.parameters(),
+        lr=learning_rate,
+        weight_decay=0.01,
+        betas=(0.9, 0.999),
+        eps=1e-8
+    )
 
-        # Initialize results tracking
-        results = {
-            'episode_rewards': [],
-            'avg_losses': [],
-            'learning_rates': []
-        }
+    # Multi-stage learning rate scheduler
+    warmup_steps = num_episodes // 10
+    plateau_steps = num_episodes // 5
+    
+    schedulers = {
+        'warmup': optim.lr_scheduler.LinearLR(
+            optimizer, 
+            start_factor=0.1,
+            end_factor=1.0,
+            total_iters=warmup_steps
+        ),
+        'cyclic': optim.lr_scheduler.CyclicLR(
+            optimizer,
+            base_lr=learning_rate,
+            max_lr=learning_rate * 10,
+            step_size_up=plateau_steps,
+            mode='triangular2',
+            cycle_momentum=False
+        )
+    }
 
-        # Early stopping parameters
-        patience = 20
-        best_reward = float('-inf')
-        no_improve = 0
+    # Temperature scaling for exploration
+    temperature = 1.0
+    temp_decay = 0.995
 
-        steps_done = 0
+    # Epsilon greedy parameters
+    epsilon_start = 1.0
+    epsilon_end = 0.01
+    epsilon_decay = 0.995
+    epsilon = epsilon_start
 
-        if args.resume:
-            policy_net.load_state_dict(torch.load(args.policy_net))
-            target_net.load_state_dict(torch.load(args.target_net))
+    memory = PrioritizedReplayMemory(memory_capacity)
+    frame_stack = FrameStack(stack_size=4)
+    scaler = GradScaler()
 
-        # Start training?
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+    state_batch = torch.zeros(
+        (batch_size, 4, 128, 128),
+        dtype=torch.float16,
+        device=device,
+        requires_grad=False
+    ).to(memory_format=torch.channels_last)
+
+    # Initialize results tracking
+    results = {
+        'episode_rewards': [],
+        'avg_losses': [],
+        'learning_rates': [],
+        'epsilon': [],
+        'temperature': []
+    }
+
+    # Early stopping parameters
+    patience = 50
+    best_reward = -1 # Since we want to focus on score, we can assume it will never go below 0 on its own
+    no_improve = 0
+
+    steps_done = 0
+
+    if resume:
+        with open(policy_net_path, 'rb') as f:
+            policy_net.load_state_dict(torch.load(f))
+        with open(target_net_path, 'rb') as f:
+            target_net.load_state_dict(torch.load(f))
+
+    # Start training?
+    try:
         with torch.cuda.device(device):
             for episode in range(num_episodes):
+                # Apply schedulers
+                if episode < warmup_steps:
+                    schedulers['warmup'].step()
+                else:
+                    schedulers['cyclic'].step()
+
                 episode_losses = []
+                episode_buffer = EpisodeBuffer(gamma=gamma)
+                
                 with torch.cuda.stream(compute_stream):
                     state = env.reset()
                     state = preprocess_state_batch(state, frame_stack).to(device)
@@ -298,88 +406,114 @@ def main(weights=None, num_episodes=1000, max_moves=-1, display_enabled=True):
                     done = False
 
                     while not done:
+                        # Temperature-scaled exploration
                         with autocast(device_type='cuda', dtype=torch.float16):
-                            state = state.reshape(-1, 4, 128, 128)  # Ensure correct shape
-                            action = policy_net(state).argmax(dim=1).item()
+                            state = state.reshape(-1, 4, 128, 128)
+                            q_values = policy_net(state) / temperature
+                            
+                            # Epsilon-greedy with legal action masking
+                            if random.random() < epsilon:
+                                legal_actions = env.get_legal_actions()
+                                action = random.choice(legal_actions)
+                            else:
+                                # Mask illegal actions with large negative values
+                                action_mask = torch.tensor(env.get_legal_actions_mask(), 
+                                                        device=device, 
+                                                        dtype=torch.float16)
+                                masked_q_values = q_values + (action_mask - 1) * 1e9
+                                action = masked_q_values.argmax(dim=1).item()
 
                         # Perform action
                         next_state, reward, done = env.step(action)
-                        
+                        if reward != 0:
+                            reward = reward_normalizer.normalize(torch.tensor(reward, device=device)).item()
+
                         with torch.cuda.stream(memory_stream):
                             next_state = preprocess_state_batch(next_state, frame_stack)
+                            next_state = next_state.to(device)
+
+                            # Store transition in episode buffer instead of memory
+                            episode_buffer.push(state, action, reward, next_state, done)
 
                         memory_stream.synchronize()
                         total_reward += reward
-
-                        # Store transition in memory
-                        memory.push(state, action, reward, next_state, done)
                         state = next_state
                         steps_done += 1
 
-                        # Sample a batch and optimize model
-                        if len(memory) >= batch_size:
-                            batch, indices, weights = memory.sample(batch_size)
-                            if batch is None:
-                                continue
-                                
-                            transitions = batch
-                            batch = Transition(*zip(*transitions))
+                        # Update exploration parameters
+                        epsilon = max(epsilon_end, epsilon * epsilon_decay)
+                        temperature = max(0.1, temperature * temp_decay)
 
-                            # Prepare batches efficiently
-                            with torch.cuda.stream(memory_stream):
-                                state_batch = torch.stack(batch.state).reshape(-1, 4, 128, 128)
-                                action_batch = torch.tensor(batch.action, device=device).unsqueeze(1)
-                                reward_batch = torch.tensor(batch.reward, device=device)
-                                next_state_batch = torch.stack(batch.next_state).reshape(-1, 4, 128, 128)
-                                done_batch = torch.tensor(batch.done, device=device, dtype=torch.float16)
+                # Process episode buffer and update memory after episode completion
+                episode_buffer.get_transitions(memory)
 
-                            memory_stream.synchronize()
-
-                            # Training step with mixed precision
-                            with autocast(device_type='cuda', dtype=torch.float16):
-                                next_actions = policy_net(next_state_batch).argmax(dim=1, keepdim=True)
-                                next_q_values = target_net(next_state_batch).gather(1, next_actions)
-                                expected_q_values = reward_batch + gamma * next_q_values * (1 - done_batch)
-                                q_values = policy_net(state_batch).gather(1, action_batch)
-                                
-                                # Use weights in loss calculation
-                                td_errors = torch.abs(q_values - expected_q_values.detach()).squeeze()
-                                loss = (weights * (td_errors ** 2)).mean()
-
-                            # Scaled backprop
-                            scaler.scale(loss).backward()
+                # Training phase - only after episode completion
+                if len(memory) >= batch_size:
+                    for _ in range(4):  # Multiple training iterations per episode
+                        batch, indices, weights = memory.sample(batch_size)
+                        if batch is None:
+                            continue
                             
-                            # Clip gradients for stability
-                            scaler.unscale_(optimizer)
-                            clip_grad_norm_(policy_net.parameters(), max_norm=1.0)
+                        transitions = batch
+                        batch = Transition(*zip(*transitions))
+
+                        # Prepare batches efficiently
+                        with torch.cuda.stream(memory_stream):
+                            state_batch = torch.stack(batch.state).reshape(-1, 4, 128, 128)
+                            action_batch = torch.tensor(batch.action, device=device).unsqueeze(1)
+                            reward_batch = torch.tensor(batch.reward, device=device)
+                            next_state_batch = torch.stack(batch.next_state).reshape(-1, 4, 128, 128)
+                            done_batch = torch.tensor(batch.done, device=device, dtype=torch.float16)
+
+                        memory_stream.synchronize()
+
+                        # Training step with mixed precision
+                        with autocast(device_type='cuda', dtype=torch.float16):
+                            # Double Q-learning with temperature scaling
+                            next_q_values = policy_net(next_state_batch) / temperature
+                            next_actions = next_q_values.argmax(dim=1, keepdim=True)
+                            next_target_values = target_net(next_state_batch).gather(1, next_actions)
                             
-                            scaler.step(optimizer)
-                            optimizer.step()  # Add this line
-                            scheduler.step()  # Move this after optimizer.step()
-                            scaler.update()
-                            optimizer.zero_grad(set_to_none=True)
+                            # Enhanced TD error calculation
+                            expected_q_values = reward_batch + (gamma * next_target_values * (1 - done_batch))
+                            current_q_values = policy_net(state_batch).gather(1, action_batch)
+                            
+                            # Huber loss for stability
+                            td_errors = F.smooth_l1_loss(current_q_values, expected_q_values.detach(), 
+                                                        reduction='none')
+                            loss = (weights * td_errors).mean()
 
-                            # Reset the noise in the noisy layers
-                            policy_net.reset_noise()
-                            target_net.reset_noise()
+                        # Gradient clipping and scaling
+                        scaler.scale(loss).backward()
+                        scaler.unscale_(optimizer)
+                        clip_grad_norm_(policy_net.parameters(), max_norm=0.5)
+                        scaler.step(optimizer)
+                        scaler.update()
+                        optimizer.zero_grad(set_to_none=True)
 
-                            episode_losses.append(loss.item())
-
-                            # Update priorities
-                            new_priorities = td_errors.detach().cpu().numpy()
-                            memory.update_priorities(indices, new_priorities)
+                        episode_losses.append(loss.item())
+                        
+                        # Update priorities
+                        new_priorities = td_errors.detach().cpu().numpy()
+                        memory.update_priorities(indices, new_priorities)
 
                 # Track metrics
+                optimizer.step()
+                policy_net.reset_noise()
+                target_net.reset_noise()
+                
                 avg_loss = np.mean(episode_losses) if episode_losses else 0
                 results['episode_rewards'].append(total_reward)
                 results['avg_losses'].append(avg_loss)
-                results['learning_rates'].append(scheduler.get_last_lr()[0])
+                results['learning_rates'].append(schedulers['cyclic'].get_last_lr()[0])
+                results['epsilon'].append(epsilon)
+                results['temperature'].append(temperature)
 
                 # Early stopping check
-                if total_reward > best_reward:
-                    best_reward = total_reward
+                score = env.get_score()
+                if score > best_reward:
+                    best_reward = score
                     no_improve = 0
-                    torch.save(policy_net.state_dict(), f'{model_dir}/best_model.pth')
                 else:
                     no_improve += 1
                     if no_improve >= patience:
@@ -391,8 +525,9 @@ def main(weights=None, num_episodes=1000, max_moves=-1, display_enabled=True):
                     target_net.load_state_dict(policy_net.state_dict())
 
                 print(f"Episode {episode}: Total Reward = {total_reward}")
+                reward_normalizer.reset()
 
-                if episode != 0 and episode % args.save_interval == 0:
+                if episode != 0 and episode % save_interval == 0:
                     # Save model and current results
                     torch.save(policy_net.state_dict(), f'{model_dir}/tetris_policy_net_{episode}.pth')
                     torch.save(target_net.state_dict(), f'{model_dir}/tetris_target_net_{episode}.pth')
@@ -406,15 +541,41 @@ def main(weights=None, num_episodes=1000, max_moves=-1, display_enabled=True):
         torch.save(policy_net.state_dict(), f'{model_dir}/tetris_policy_net_final.pth')
         torch.save(target_net.state_dict(), f'{model_dir}/tetris_target_net_final.pth')
 
-
     except Exception as e:
         print(e)
         traceback.print_exc()
-        cleanup(env, render_queue, display_proc, display_enabled)
+        cleanup(env, render_queue, display_thr, display_enabled)
     finally:
-        cleanup(env, render_queue, display_proc, display_enabled)
+        cleanup(env, render_queue, display_thr, display_enabled)
         return best_reward
 
-
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description='Train DDQN on Tetris')
+    parser.add_argument('--resume', type=bool, default=None)
+    parser.add_argument('--num_episodes', type=int, default=1000)
+    parser.add_argument('--batch_size', type=int, default=128)
+    parser.add_argument('--gamma', type=float, default=0.99)
+    parser.add_argument('--target_update', type=int, default=10)
+    parser.add_argument('--memory_capacity', type=int, default=10000)
+    parser.add_argument('--learning_rate', type=float, default=3e-4)
+    parser.add_argument('--policy_net', type=str, default='tetris_policy_net.pth')
+    parser.add_argument('--target_net', type=str, default='tetris_target_net.pth')
+    parser.add_argument('--max_moves', type=int, default=100)
+    parser.add_argument('--save_interval', type=int, default=500)
+    parser.add_argument('--weights', type=str, default=None)
+
+    args = parser.parse_args()
+    main(
+        resume=args.resume,
+        num_episodes=args.num_episodes,
+        batch_size=args.batch_size,
+        gamma=args.gamma,
+        target_update=args.target_update,
+        memory_capacity=args.memory_capacity,
+        learning_rate=args.learning_rate,
+        policy_net_path=args.policy_net,
+        target_net_path=args.target_net,
+        max_moves=args.max_moves,
+        save_interval=args.save_interval,
+        weights=args.weights
+    )

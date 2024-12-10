@@ -10,6 +10,8 @@ import torch.multiprocessing as torch_mp
 import gc
 import torch
 
+import argparse
+
 from typing import List, Dict
 
 from DDQNonCNN import main as train_ddqn
@@ -196,12 +198,19 @@ class GeneticOptimizer:
 
 
 if __name__ == "__main__":
+    # Check for debug flag
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--debug", default=False)
+    args = parser.parse_args()
+    if args.debug:
+        print("Running in debug mode")
+        os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
     optimizer = GeneticOptimizer(
         population_size=10,
-        num_generations=15,
+        num_generations=20,
         mutation_rate=0.1,
-        num_episodes=100,
-        max_moves=40
+        num_episodes=200,
+        max_moves=100
     )
     best_weights, best_fitness = optimizer.run()
     print(f"\nOptimization complete!")
