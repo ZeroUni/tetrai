@@ -104,10 +104,10 @@ class GeneticOptimizer:
                 active_processes = 0
                 individual_index = 0
                 
-                # Process population in batches of 5
+                # Process population in batches of 4
                 while individual_index < len(population):
                     # Start new processes until we hit limit or run out
-                    while active_processes < 5 and individual_index < len(population):
+                    while active_processes < 3 and individual_index < len(population):
                         p = torch_mp.Process(
                             target=self.evaluate_individual,
                             args=(population[individual_index], result_queue, completion_queue)

@@ -551,6 +551,7 @@ class TetrisEnv:
             done = False
 
             # Apply action
+            actions_per_piece = self.game_state.actions_per_piece
             self.apply_action(action)
 
             # Update game state
@@ -558,7 +559,7 @@ class TetrisEnv:
 
             # Calculate reward
             if self.game_state.give_reward:
-                reward += calculate_reward(self.game_state.board, self.game_state.score, self.game_state.lines_cleared, self.tensor_weights, BOARD_HEIGHT, BOARD_WIDTH, self.game_state.actions_per_piece)
+                reward += calculate_reward(self.game_state.board, self.game_state.score, self.game_state.lines_cleared, self.tensor_weights, BOARD_HEIGHT, BOARD_WIDTH, actions_per_piece)
                 self.game_state.give_reward = False
 
             if self.game_state.game_over:
@@ -611,6 +612,122 @@ class TetrisEnv:
         if moved and self.game_state.is_landing:
             # Reset lock timer if the piece moved or rotated while landing
             self.game_state.lock_timer = pygame.time.get_ticks()
+
+    def get_legal_actions(self) -> list:
+        """Get list of legal actions in current state
+        
+        Returns:
+            list: List of legal action indices (0-7)
+        """
+        legal = []
+        
+        # Hard drop is always legal
+        legal.append(0)
+        
+        # Check rotations
+        # Right rotation
+        temp_rot = (self.game_state.rotation_index + 1) % 4
+        if self.check_rotation(temp_rot):
+            legal.append(1)
+            
+        # Left rotation  
+        temp_rot = (self.game_state.rotation_index - 1) % 4
+        if self.check_rotation(temp_rot):
+            legal.append(2)
+        
+        # Down move
+        if self.game_state.valid_position(adj_y=1):
+            legal.append(3)
+            
+        # Left move
+        if self.game_state.valid_position(adj_x=-1):
+            legal.append(4)
+            
+        # Right move
+        if self.game_state.valid_position(adj_x=1):
+            legal.append(5)
+            
+        # Do nothing is always legal
+        legal.append(6)
+        
+        # Hold is legal if not already used
+        if self.game_state.can_hold:
+            legal.append(7)
+            
+        return legal
+    
+    def get_legal_actions_mask(self) -> torch.Tensor:
+        """Get binary mask of legal actions
+        
+        Returns:
+            torch.Tensor: Binary mask where 1 indicates legal action
+        """
+        # Initialize mask with zeros
+        mask = torch.zeros(8, dtype=torch.float16, device='cuda')
+        
+        # Hard drop and do nothing always legal
+        mask[0] = 1  # Hard drop
+        mask[6] = 1  # Do nothing
+        
+        # Check rotations
+        # Right rotation
+        temp_rot = (self.game_state.rotation_index + 1) % 4
+        if self.check_rotation(temp_rot):
+            mask[1] = 1
+            
+        # Left rotation
+        temp_rot = (self.game_state.rotation_index - 1) % 4  
+        if self.check_rotation(temp_rot):
+            mask[2] = 1
+        
+        # Down move
+        if self.game_state.valid_position(adj_y=1):
+            mask[3] = 1
+            
+        # Left move
+        if self.game_state.valid_position(adj_x=-1):
+            mask[4] = 1
+            
+        # Right move
+        if self.game_state.valid_position(adj_x=1):
+            mask[5] = 1
+            
+        # Hold piece
+        if self.game_state.can_hold:
+            mask[7] = 1
+            
+        return mask
+    
+    def check_rotation(self, new_rotation: int) -> bool:
+        """Helper to check if rotation is valid considering wall kicks
+        
+        Args:
+            new_rotation: Target rotation index
+            
+        Returns:
+            bool: True if rotation is valid
+        """
+        old_rotation = self.game_state.rotation_index
+        old_position = self.game_state.position.copy()
+        rotated_shape = self.game_state.current_piece['shape'][new_rotation]
+    
+        # Get wall kicks for this rotation transition
+        rotation_transition = (old_rotation, new_rotation) 
+        kicks = WALL_KICKS[self.game_state.current_piece['type']].get(rotation_transition, [])
+    
+        # Try each wall kick
+        for dx, dy in kicks:
+            test_x = old_position[1] + dx
+            test_y = old_position[0] + dy
+            
+            # Create temp position and check
+            test_pos = [test_y, test_x]
+            if self.game_state.valid_position(piece=rotated_shape, 
+                                            adj_x=test_x-old_position[1],
+                                            adj_y=test_y-old_position[0]):
+                return True
+                
+        return False
 
     def update_game_state(self):
         current_time = pygame.time.get_ticks()
@@ -900,7 +1017,7 @@ def calculate_reward(board, score: int, lines: int, weights, BOARD_HEIGHT: int, 
     height_component = (max_height * max_height) * weights[3]
     holes_component = holes * weights[4]
     bumpiness_component = bumpiness * weights[5]
-    actions_component = actions_taken * weights[6]
+    actions_component = (actions_taken * actions_taken) * weights[6]
 
     # Print out the components for debugging
     # print(f"Score: {score_component.item()} Lines: {lines_component.item()} Fill: {fill_component.item()} Height: {height_component.item()} Holes: {holes_component.item()} Bumpiness: {bumpiness_component.item()} Actions: {actions_component.item()}")

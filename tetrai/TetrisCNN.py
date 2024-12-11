@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.amp import autocast
 
 class NoisyLinear(nn.Module):
     def __init__(self, in_features, out_features, sigma_init=0.017, device='cuda'):
@@ -163,36 +164,52 @@ class RainbowTetrisCNN(nn.Module):
         self.register_buffer('supports', torch.linspace(v_min, v_max, num_atoms).to(device))
         self.register_buffer('delta_z', torch.tensor((v_max - v_min) / (num_atoms - 1)).to(device))
 
+        # Convert model to channels_last memory format for better GPU utilization
+        self = self.to(memory_format=torch.channels_last)
+
     def extract_features(self, x):
-        x = x.contiguous()
+        # Convert input to channels_last for better performance
+        x = x.contiguous(memory_format=torch.channels_last)
         x = self.features(x)
 
         batch_size = x.size(0)
-        x_att = x.view(batch_size, 128, -1).permute(2, 0, 1)
-
+        # More efficient reshape using flatten
+        x_att = x.flatten(2).transpose(1, 2)
+        
+        # Optimize attention computation
         x_out, _ = self.attention(x_att, x_att, x_att)
+        
+        # Efficient reshape back to original format
+        x = x_out.transpose(1, 2).view(batch_size, 128, 16, 16)
+        x = x.add_(x_att.transpose(1, 2).view(batch_size, 128, 16, 16))
+        
+        return x.flatten(1)
 
-        x = x_out.permute(1, 2, 0).view(batch_size, 128, 16, 16)
-
-        x = x + x_att.permute(1, 2, 0).view(batch_size, 128, 16, 16)
-
-        return x.reshape(batch_size, -1)
-    
     def dqn_forward(self, x):
         x = self.extract_features(x)
-        advantage = self.dqn_advantage(x).view(-1, self.num_actions, self.num_atoms)
-        value = self.dqn_value(x).view(-1, 1, self.num_atoms)
-        q_values = value + advantage - advantage.mean(dim=1, keepdim=True)
+        advantage = self.dqn_advantage(x).reshape(-1, self.num_actions, self.num_atoms)
+        value = self.dqn_value(x).reshape(-1, 1, self.num_atoms)
+        # Expand value to match advantage shape for proper broadcasting
+        value = value.expand(-1, self.num_actions, self.num_atoms)
+        # Calculate Q-values using dueling architecture
+        advantage_mean = advantage.mean(dim=1, keepdim=True)
+        q_values = value + advantage - advantage_mean
         return F.softmax(q_values, dim=-1)
-    
+
     def ppo_forward(self, x):
         x = self.extract_features(x)
+        # Compute both outputs in parallel
         return self.ppo_actor(x), self.ppo_critic(x)
-    
-    def reset_noise(self):
-        for layer in self.children():
-            if hasattr(layer, 'reset_noise'):
-                layer.reset_noise()
+
+    def get_action(self, x, mode='dqn'):
+        with torch.no_grad(), autocast():
+            if mode == 'dqn':
+                probs = self.dqn_forward(x)
+                q_values = torch.sum(probs * self.supports, dim=-1)
+                return torch.argmax(q_values, dim=-1)
+            elif mode == 'ppo':
+                action_probs, _ = self.ppo_forward(x)
+                return torch.distributions.Categorical(action_probs).sample()
 
     def forward(self, x, mode='dqn'):
         if mode == 'dqn':
@@ -202,16 +219,9 @@ class RainbowTetrisCNN(nn.Module):
         else:
             raise ValueError(f"Unknown mode: {mode}")
         
-    def get_action(self, x, mode='dqn'):
-        with torch.no_grad():
-            if mode == 'dqn':
-                probs = self.dqn_forward(x)
-                q_values = (probs * self.supports).sum(dim=-1)
-                return q_values.argmax(dim=-1)
-            elif mode == 'ppo':
-                action_probs, _ = self.ppo_forward(x)
-                return torch.distributions.Categorical(action_probs).sample()
-
-
+    def reset_noise(self):
+        for layer in self.children():
+            if hasattr(layer, 'reset_noise'):
+                layer.reset_noise()
 
 # Actions are: rotate right, rotate left, push down / left / right, force down, hold, NOTHING - 8 actions
