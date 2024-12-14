@@ -29,6 +29,7 @@ import random
 import TetrisCNN
 import TetrisEnv
 from rewardNormalizer import RewardNormalizer
+from trainingUtils import DisplayManager
 
 import json
 from torch.profiler import profile, record_function, ProfilerActivity
@@ -653,14 +654,13 @@ def display_images(render_queue):
             break
     cv2.destroyWindow(window_name)
 
-def cleanup(env, render_queue=None, display_thr=None, display_enabled=False):
+def cleanup(env, display_manager=None, display_enabled=False):
     env.close()
     torch.cuda.synchronize()
     torch.cuda.empty_cache()
     torch.cuda.ipc_collect()
-    if display_enabled and render_queue and display_thr:
-        render_queue.put(None)
-        display_thr.join()
+    if display_enabled and display_manager:
+        display_manager.stop()
 
 import threading
 from queue import Queue
@@ -877,12 +877,10 @@ def main(
     reward_normalizer = RewardNormalizer()
     
     if display_enabled:
-        render_queue = multiprocessing.Queue()
-        display_thr = threading.Thread(target=display_images, args=(render_queue,))
-        display_thr.start()
+        display_manager = DisplayManager()
+        display_manager.start()
     else:
-        display_thr = None
-        render_queue = None
+        display_manager = None
     
     # Load the weights from json if provided
     if weights:
@@ -893,7 +891,7 @@ def main(
             pass
 
 
-    env = TetrisEnv.TetrisEnv(render_queue, max_moves=max_moves, weights=weights, level=level)
+    env = TetrisEnv.TetrisEnv(display_manager=display_manager, max_moves=max_moves, weights=weights, level=level)
     env.render_mode = False
 
     # Enhanced optimizer with weight decay
@@ -1270,11 +1268,11 @@ def main(
     except Exception as e:
         print(e)
         traceback.print_exc()
-        cleanup(env, render_queue, display_thr, display_enabled)
+        cleanup(env, display_manager, display_enabled)
     finally:
         buffer_processor.cleanup()
         # Ensure thorough cleanup
-        cleanup(env, render_queue, display_thr, display_enabled)
+        cleanup(env, display_manager, display_enabled)
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
         return best_reward
@@ -1364,5 +1362,6 @@ if __name__ == "__main__":
         level=args.level,
         level_inc=args.level_inc,
         cycles=args.cycles,
-        debug=args.debug
+        debug=args.debug,
+        display_enabled=False
     )

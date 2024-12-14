@@ -428,7 +428,7 @@ class GameState:
         return num_cleared
 
 class TetrisEnv:
-    def __init__(self, render_queue=None, max_moves=-1, weights=None, manual=False, level=1):
+    def __init__(self, display_manager=None, max_moves=-1, weights=None, manual=False, level=1):
         try:
             if not pygame.get_init():
                 pygame.init()
@@ -471,7 +471,7 @@ class TetrisEnv:
         self.last_render_time = pygame.time.get_ticks()
 
         self.lock = threading.Lock()
-        self.render_queue = render_queue
+        self.display_manager = display_manager
 
         self.max_moves = max_moves
         self.move_count = 0
@@ -870,8 +870,8 @@ class TetrisEnv:
         image = np.flip(image, axis=0)  # Flip vertically 
         image = np.rot90(image, -1, axes=(0, 1))
 
-        if self.render_queue:
-            self.render_queue.put(image.copy())
+        if self.display_manager:
+            self.display_manager.update(image.copy())
         
         # Convert to grayscale using optimized numpy operations
         image = np.mean(image, axis=2, dtype=np.uint8)
