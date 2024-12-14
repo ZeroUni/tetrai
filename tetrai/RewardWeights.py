@@ -69,6 +69,7 @@ class GeneticOptimizer:
             score = train_ddqn(weights=weights, 
                              num_episodes=self.num_episodes,
                              max_moves=self.max_moves,
+                             patience=40,
                              display_enabled=False)
             print(f"Evaluated weights: {weights}, score: {score}")
             

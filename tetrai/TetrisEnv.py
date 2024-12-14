@@ -227,13 +227,33 @@ WALL_KICKS = {
     }
 }
 
+# Define piece sets for each level
+LEVEL_PIECES = {
+    1: ['O', 'I'],
+    2: ['O', 'I', 'L', 'J', 'T'],
+    3: ['O', 'I', 'L', 'J', 'T', 'S', 'Z']
+}
+
 class GameState:
-    def __init__(self):
+    def __init__(self, level=1):
+        # Pre-allocate tensors and pin them to GPU
         self.board = torch.zeros((BOARD_HEIGHT, BOARD_WIDTH), 
                                dtype=torch.int8,
                                device='cuda')
         self.temp_board = torch.zeros_like(self.board)
         self.visited = torch.zeros_like(self.board, dtype=torch.bool)
+        
+        # Cache tensors for piece operations
+        self.piece_matrix = torch.zeros((4, 4), dtype=torch.int8, device='cuda')
+        self.position_tensor = torch.zeros(2, dtype=torch.int32, device='cuda')
+        
+        # Cache piece matrices as tensors
+        self.piece_tensors = {
+            piece_type: torch.tensor(shapes, device='cuda', dtype=torch.int8)
+            for piece_type, shapes in SHAPES.items()
+        }
+        
+        self.level = level
         self.current_piece = self.get_new_piece()
         self.next_pieces = [self.get_new_piece() for _ in range(5)]
         self.hold_piece = None
@@ -249,14 +269,9 @@ class GameState:
         self.actions_per_piece = 0
         self.give_reward = False
 
-        # Cache piece matrices as tensors
-        self.piece_tensors = {
-            piece_type: torch.tensor(shapes, device='cuda', dtype=torch.int8)
-            for piece_type, shapes in SHAPES.items()
-        }
-
     def get_new_piece(self):
-        shape_type = random.choice(list(SHAPES.keys()))
+        available_pieces = LEVEL_PIECES[self.level]
+        shape_type = random.choice(available_pieces)
         return {'type': shape_type, 'shape': SHAPES[shape_type]}
 
     def rotate_piece(self, direction):
@@ -305,50 +320,42 @@ class GameState:
             self.can_hold = False
 
     def valid_position(self, piece=None, adj_x=0, adj_y=0):
-        """Check if piece position is valid
-        
-        Args:
-            piece: Optional piece matrix. Uses current piece if None
-            adj_x: X position adjustment
-            adj_y: Y position adjustment
-            
-        Returns:
-            bool: True if position is valid
-        """
+        """GPU-optimized position validation"""
         if piece is None:
             piece = self.current_piece['shape'][self.rotation_index]
-            
-        # Convert piece to tensor if needed
-        piece_tensor = torch.tensor(piece, device='cuda', dtype=torch.int8)
-        piece_height, piece_width = piece_tensor.shape
+            piece = torch.tensor(piece, device='cuda', dtype=torch.int8)
+        elif isinstance(piece, list):
+            piece = torch.tensor(piece, device='cuda', dtype=torch.int8)
+                
+        # Use cached piece matrix
+        self.piece_matrix.zero_()
+        self.piece_matrix[:piece.size(0), :piece.size(1)].copy_(piece)
         
-        # Calculate new position 
-        new_y = self.position[0] + adj_y
-        new_x = self.position[1] + adj_x
-
-        # Check bounds only for non-zero cells
-        non_zero_y, non_zero_x = torch.where(piece_tensor == 1)
+        # Calculate new position using cached tensor
+        self.position_tensor[0] = self.position[0] + adj_y
+        self.position_tensor[1] = self.position[1] + adj_x
         
-        # Get actual coordinates of non-zero cells
-        board_y = new_y + non_zero_y
-        board_x = new_x + non_zero_x
+        # Get piece bounds efficiently
+        non_zero_y, non_zero_x = torch.where(self.piece_matrix == 1)
         
-        # Check if any non-zero cells are outside board bounds
-        if (torch.any(board_x >= BOARD_WIDTH) or 
-            torch.any(board_x < 0) or           # Add check for negative x
+        # Calculate board positions
+        board_y = self.position_tensor[0] + non_zero_y
+        board_x = self.position_tensor[1] + non_zero_x
+        
+        # Check bounds in single operation
+        if (torch.any(board_x >= BOARD_WIDTH) or
+            torch.any(board_x < 0) or
             torch.any(board_y >= BOARD_HEIGHT)):
             return False
-            
-        # Filter points that are on the board (y >= 0)
-        valid_points = board_y >= 0
-        board_y = board_y[valid_points]
-        board_x = board_x[valid_points]
+                
+        # Filter valid board positions
+        valid_mask = board_y >= 0
+        board_y = board_y[valid_mask]
+        board_x = board_x[valid_mask]
         
-        # If no points are on board, piece is valid
         if len(board_y) == 0:
             return True
-            
-        # Check collision with board pieces in one operation
+                
         return not torch.any(self.board[board_y, board_x] != 0)
 
     def lock_piece(self):
@@ -421,7 +428,7 @@ class GameState:
         return num_cleared
 
 class TetrisEnv:
-    def __init__(self, render_queue=None, max_moves=-1, weights=None, manual=False):
+    def __init__(self, render_queue=None, max_moves=-1, weights=None, manual=False, level=1):
         try:
             if not pygame.get_init():
                 pygame.init()
@@ -454,7 +461,8 @@ class TetrisEnv:
             self.screen = Surface((SCREEN_WIDTH, SCREEN_HEIGHT))
 
         self.clock = pygame.time.Clock()
-        self.game_state = GameState()
+        self.level = min(max(1, level), 3)  # Ensure level is between 1 and 3
+        self.game_state = GameState(level=self.level)
         self.fall_time = 0
         self.fall_speed = 0.5  # Seconds per fall
         self.last_move_time = pygame.time.get_ticks()
@@ -539,7 +547,7 @@ class TetrisEnv:
             # Clear CUDA memory
             if hasattr(self, 'state_tensor'):
                 self.state_tensor.zero_()
-            self.game_state = GameState()
+            self.game_state = GameState(level=self.level)
             self.fall_time = 0
             self.last_move_time = pygame.time.get_ticks()
             self.move_count = 0
@@ -568,6 +576,7 @@ class TetrisEnv:
 
             self.move_count += 1
             if 0 < self.max_moves <= self.move_count:
+                reward -= pow(actions_per_piece, 3) * 0.8  # Penalty for taking too long
                 done = True  # End episode due to max moves
 
             return self.get_state(), reward, done
@@ -602,12 +611,12 @@ class TetrisEnv:
                 if self.game_state.valid_position(adj_x=1):
                     self.game_state.position[1] += 1
                     moved = True
-            case 6:  # Nothing
-                return
-            case 7:  # Hold
+            case 6:  # Hold
                 self.game_state.hold_current_piece()
                 moved = True
                 self.game_state.actions_per_piece -= 1
+            case 7:  # Nothing
+                return
 
         if moved and self.game_state.is_landing:
             # Reset lock timer if the piece moved or rotated while landing
@@ -866,7 +875,7 @@ class TetrisEnv:
         
         # Convert to grayscale using optimized numpy operations
         image = np.mean(image, axis=2, dtype=np.uint8)
-        
+
         return image
 
     def render(self):
@@ -915,6 +924,19 @@ class TetrisEnv:
         torch.cuda.empty_cache()
         pygame.quit()
         gc.collect()
+
+    def increase_level(self):
+        """Increase curriculum level if not at max"""
+        if self.level < 3:
+            self.level += 1
+            # Update game state with new level
+            self.game_state.level = self.level
+            return True
+        return False
+
+    def get_level(self) -> int:
+        """Get current curriculum level"""
+        return self.level
 
 @torch.jit.script
 def count_holes(board, heights, BOARD_HEIGHT: int, BOARD_WIDTH: int) -> int:
@@ -988,7 +1010,7 @@ def calculate_heights(board, BOARD_HEIGHT: int) -> torch.Tensor:
     return heights
 
 @torch.jit.script
-def calc_fill_reward(board, heights, BOARD_HEIGHT: int, BOARD_WIDTH: int) -> float:
+def calc_fill_reward(board, BOARD_HEIGHT: int, BOARD_WIDTH: int) -> float:
     """Calculate reward for filling rows"""
     fill_reward = 0.
     for row in range(BOARD_HEIGHT):
@@ -1001,10 +1023,10 @@ def calculate_reward(board, score: int, lines: int, weights, BOARD_HEIGHT: int, 
     heights = calculate_heights(board, BOARD_HEIGHT)
     holes = torch.tensor(float(count_holes(board, heights, BOARD_HEIGHT, BOARD_WIDTH)), device='cuda')
     bumpiness = torch.tensor(float(torch.sum(torch.abs(heights[:-1] - heights[1:])).item()), device='cuda')
-    fill_reward = torch.tensor(float(calc_fill_reward(board, heights, BOARD_HEIGHT, BOARD_WIDTH)), device='cuda')
+    fill_reward = torch.tensor(float(calc_fill_reward(board, BOARD_HEIGHT, BOARD_WIDTH)), device='cuda')
     max_height = torch.tensor(float(torch.max(heights).item()), device='cuda')
     # If the value of max_height is less than 4, set it to 0 to avoid penalizing low height
-    max_height = torch.where(max_height < 4, torch.tensor(0, device='cuda'), max_height)
+    max_height = torch.where(max_height < 5, torch.tensor(0, device='cuda'), max_height)
     
     # Convert score and lines to tensors
     score_t = torch.tensor(float(score), device='cuda')
@@ -1014,10 +1036,13 @@ def calculate_reward(board, score: int, lines: int, weights, BOARD_HEIGHT: int, 
     score_component = score_t * weights[0]
     lines_component = lines_t * weights[1]
     fill_component = fill_reward * weights[2]
-    height_component = (max_height * max_height) * weights[3]
+    height_component = torch.pow(max_height, 3) * weights[3]
     holes_component = holes * weights[4]
     bumpiness_component = bumpiness * weights[5]
-    actions_component = (actions_taken * actions_taken) * weights[6]
+    if actions_taken > 8:
+        actions_component = (actions_taken * actions_taken) * weights[6]
+    else:
+        actions_component = torch.tensor(0., device='cuda')
 
     # Print out the components for debugging
     # print(f"Score: {score_component.item()} Lines: {lines_component.item()} Fill: {fill_component.item()} Height: {height_component.item()} Holes: {holes_component.item()} Bumpiness: {bumpiness_component.item()} Actions: {actions_component.item()}")
