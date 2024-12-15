@@ -520,157 +520,219 @@ class EpisodeBuffer:
 class PreprocessingPool:
     def __init__(self, size=32):
         self.size = size
-        # Pre-allocate tensors with correct shapes
-        self.cpu_pool = torch.zeros((size, 1, 128, 128),  # Final size only
-                                  dtype=torch.uint8,
-                                  pin_memory=True)
+        
+        # Create pinned CPU tensors first
+        self.cpu_pool = torch.zeros((size, 1, 128, 128),
+                                  dtype=torch.float16,
+                                  device='cpu').pin_memory()
+        
+        # Create separate CUDA tensor
         self.gpu_pool = torch.zeros((size, 1, 128, 128),
                                   dtype=torch.float16,
-                                  device='cuda')
+                                  device='cuda').to(memory_format=torch.channels_last)
+        
         self.available = set(range(size))
         self.in_use = {}
         self.lock = threading.Lock()
         
-        # Create CUDA streams for async operations
+        # Create CUDA streams for parallel operations
         self.streams = [torch.cuda.Stream() for _ in range(2)]
 
     @torch.no_grad()
-    def get_tensors(self):
+    def get_tensor(self):
         with self.lock:
             if not self.available:
-                return None, None
-                
-            idx = self.available.pop()
-            cpu_tensor = self.cpu_pool[idx]
-            gpu_tensor = self.gpu_pool[idx]
+                return None
             
-            self.in_use[cpu_tensor.data_ptr()] = idx
-            return cpu_tensor, gpu_tensor
+            idx = self.available.pop()
+            # Return GPU tensor
+            tensor = self.gpu_pool[idx]
+            self.in_use[tensor.data_ptr()] = idx
+            return tensor
 
-    def return_tensors(self, cpu_tensor, gpu_tensor):
+    def return_tensor(self, tensor):
         with self.lock:
-            if cpu_tensor is None or gpu_tensor is None:
-                return
-                
-            ptr = cpu_tensor.data_ptr()
+            ptr = tensor.data_ptr()
             if ptr in self.in_use:
                 idx = self.in_use.pop(ptr)
                 self.available.add(idx)
-                # Clear the tensors
-                self.cpu_pool[idx].zero_()
                 self.gpu_pool[idx].zero_()
-            # Else silently ignore tensors not from our pool
+                self.cpu_pool[idx].zero_()
 
     def reset(self):
         with self.lock:
             self.available = set(range(self.size))
             self.in_use.clear()
-            self.cpu_pool.zero_()
             self.gpu_pool.zero_()
+            self.cpu_pool.zero_()
             torch.cuda.empty_cache()
 
-    def __del__(self):
-        # Ensure cleanup on deletion
-        self.reset()
-        del self.cpu_pool
-        del self.gpu_pool
-
-def preprocess_state_batch(states, frame_stack=None, preprocess_pool=None):
-    """
-        Preprocess a batch of states for input to the model.
-
-        Args:
-            states: List of states to preprocess
-            frame_stack: FrameStack object for stacking frames
-            preprocess_pool: PreprocessingPool object for efficient memory management
-
-        Returns:
-            Preprocessed tensor of states
-    """
-    if not isinstance(states, list):
-        states = [states]
+class FrameStack:
+    def __init__(self, stack_size):
+        self.stack_size = stack_size
+        self.frames = []
+        self.device = 'cuda'
         
-    gpu_tensor = torch.zeros((len(states), 1, 128, 128),
-                           dtype=torch.float16, 
-                           device='cuda')
-    
-    with torch.cuda.stream(torch.cuda.current_stream()):
-        for i, state in enumerate(states):
-            state_tensor = torch.from_numpy(state).float() / 255.0
-            if state_tensor.dim() == 2:
-                state_tensor = state_tensor.unsqueeze(0).unsqueeze(0)
-            elif state_tensor.dim() == 3:
-                state_tensor = state_tensor.unsqueeze(0)
+        # Create pinned CPU tensor
+        self.cpu_buffer = torch.zeros((1, stack_size, 128, 128),
+                                    dtype=torch.float16,
+                                    device='cpu').pin_memory()
+        
+        # Create separate GPU tensor
+        self.gpu_buffer = torch.zeros((1, stack_size, 128, 128),
+                                    dtype=torch.float16,
+                                    device='cuda').to(memory_format=torch.channels_last)
+                                
+        # Create workspace buffer for frame reshaping
+        self.workspace = torch.zeros((1, 1, 128, 128),
+                                   dtype=torch.float16,
+                                   device=self.device)
+
+    def reset(self):
+        self.frames.clear()
+        self.gpu_buffer.zero_()
+        self.cpu_buffer.zero_()
+        torch.cuda.empty_cache()
+
+    @torch.no_grad()
+    def __call__(self, frame):
+        # Handle frame stacking efficiently on GPU
+        with torch.cuda.stream(torch.cuda.current_stream()):
+            # Ensure input frame has correct shape [B, C, H, W]
+            if frame.dim() == 3:  # [C, H, W]
+                frame = frame.unsqueeze(0)
+            if frame.dim() == 2:  # [H, W]
+                frame = frame.unsqueeze(0).unsqueeze(0)
                 
-            resized = F.interpolate(state_tensor, 
-                                  size=(128, 128),
-                                  mode='nearest')
+            if not self.frames:
+                # Initialize with copies of first frame
+                frame = frame.to(dtype=torch.float16, device=self.device)
+                for _ in range(self.stack_size):
+                    # Ensure correct shape when storing
+                    f = frame.clone()
+                    if f.dim() == 4:  # [B, C, H, W]
+                        f = f.squeeze(1)  # Remove channel dim for storage
+                    self.frames.append(f)
+            else:
+                # Roll frames and add new frame
+                frame = frame.to(dtype=torch.float16, device=self.device)
+                if frame.dim() == 4:  # [B, C, H, W]
+                    frame = frame.squeeze(1)  # Remove channel dim for storage
+                self.frames.pop(0)
+                self.frames.append(frame)
             
-            gpu_tensor[i] = resized.to(dtype=torch.float16)
+            # Stack frames efficiently
+            self.gpu_buffer.zero_()
+            for i, f in enumerate(self.frames):
+                # Ensure frame has correct shape for copying
+                if f.dim() == 3:  # [B, H, W]
+                    f = f.unsqueeze(1)  # Add channel dim back for stacking
+                # Now f should be [B, C, H, W]
+                self.gpu_buffer[:, i].copy_(f.squeeze(1), non_blocking=True)
             
-        if frame_stack:
-            gpu_tensor = frame_stack(gpu_tensor)
-            gpu_tensor = gpu_tensor.reshape(-1, 4, 128, 128)
+            return self.gpu_buffer
+
+def preprocess_state_batch(states: torch.Tensor, frame_stack = None, preprocess_pool = None) -> torch.Tensor:
+    """
+    Optimized state preprocessing using pure tensor operations with optional pooling
     
-        # Debug output - save SINGLE FRAME, not stacked frames
-        # if len(states) > 0:
-        #     # Save the original resized frame before stacking
-        #     debug_frame = gpu_tensor[0] if not frame_stack else gpu_tensor[0, -1]
-            
-        #     # Convert to image format - ensure proper scaling
+    Args:
+        states: Input tensor of shape [B, H, W] or [B, 1, H, W]
+        frame_stack: Optional FrameStack object
+        preprocess_pool: Optional PreprocessingPool for memory efficiency
+        
+    Returns:
+        Processed tensor of shape [B, C, 128, 128]
+    """
+    # Ensure proper input shape and type
+    if states.dim() == 3:
+        states = states.unsqueeze(1)  # Add channel dimension
+    if states.dim() == 2:
+        states = states.unsqueeze(0).unsqueeze(0)  # Add batch and channel dimensions
+        
+    # Add batch dimension if needed
+    if states.dim() == 3:
+        states = states.unsqueeze(0)
+        
+    # Normalize and convert to float16 in one operation
+    states = states.to(dtype=torch.float16, device='cuda') / 255.0
+    
+    # Try to get tensor from pool
+    output = None
+    if preprocess_pool is not None:
+        output = preprocess_pool.get_tensor()
+    
+    if output is None:
+        # Fallback to direct processing
+        # Resize first
+        states = F.interpolate(states, 
+                           size=(128, 128),
+                           mode='nearest')
+        # Convert memory format
+        states = states.to(memory_format=torch.channels_last)
+        
+        # Debug output - save single frame
+        # with torch.no_grad():
+        #     debug_frame = states[0, 0] if not frame_stack else states[0, -1]
+        #     # Convert to image format and ensure proper scaling
         #     image = debug_frame.cpu().numpy()
         #     if image.max() <= 1.0:  # If normalized
         #         image = (image * 255).clip(0, 255)
         #     image = image.astype(np.uint8)
-        #     Image.fromarray(image).save(f'out/{int(time.time())}.png')
-
-    return gpu_tensor.to(memory_format=torch.channels_last)
-
-def render_thread(env):
-    while True:
-        env.render()
-        pygame.time.wait(env.render_delay)
-
-def display_images(render_queue):
-    # Create the display window
-    tag = os.getpid()
-    window_name = f'Tetris_{tag}'
-    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(window_name, 512, 512)
-
-    while True:
-        try:
-            image = render_queue.get()
-            if image is None:
-                break
-            # Convert RGB to BGR for OpenCV
-            image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
-            cv2.imshow(window_name, image)
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
-        except Exception as e:
-            print(e)
-            traceback.print_exc()
-            break
-    cv2.destroyWindow(window_name)
-
-def cleanup(env, display_manager=None, display_enabled=False):
-    env.close()
-    torch.cuda.synchronize()
-    torch.cuda.empty_cache()
-    torch.cuda.ipc_collect()
-    if display_enabled and display_manager:
-        display_manager.stop()
-
-import threading
-from queue import Queue
-import torch.multiprocessing as mp
+            
+        #     # Create debug output directory if it doesn't exist
+        #     os.makedirs('out/debug_frames', exist_ok=True)
+            
+        #     # Save image with timestamp
+        #     Image.fromarray(image).save(f'out/debug_frames/{int(time.time())}.png')
+            
+    else:
+        # Use pooled tensor
+        with torch.cuda.stream(torch.cuda.current_stream()):
+            # Resize first
+            states = F.interpolate(states,
+                               size=(128, 128),
+                               mode='nearest')
+            # Ensure states has correct shape [B, C, H, W]
+            if states.dim() < 4:
+                states = states.unsqueeze(0)
+            # Reshape output if needed to match states
+            if output.shape != states.shape:
+                output = output.view_as(states)
+            # Copy to output tensor with proper memory format
+            output.copy_(states)
+            states = output.to(memory_format=torch.channels_last)
+            
+            # Debug output for pooled tensor
+            # with torch.no_grad():
+            #     debug_frame = states[0, 0] if not frame_stack else states[0, -1]
+            #     # Convert to image format and ensure proper scaling
+            #     image = debug_frame.cpu().numpy()
+            #     if image.max() <= 1.0:  # If normalized
+            #         image = (image * 255).clip(0, 255)
+            #     image = image.astype(np.uint8)
+                
+            #     # Create debug output directory if it doesn't exist
+            #     os.makedirs('out/debug_frames', exist_ok=True)
+                
+            #     # Save image with timestamp
+            #     Image.fromarray(image).save(f'out/debug_frames/{int(time.time())}.png')
+    
+    if frame_stack is not None:
+        states = frame_stack(states)
+        states = states.reshape(-1, 4, 128, 128)
+    
+    # Return tensor to pool if we used one
+    if output is not None:
+        preprocess_pool.return_tensor(output)
+        
+    return states
 
 class AsyncBufferProcessor:
     def __init__(self, memory, device='cuda', batch_size=32):
         self.memory = memory
         self.device = device
-        self.queue = Queue()
+        self.queue = multiprocessing.Queue()
         self.processing_thread = threading.Thread(target=self._process_buffer, daemon=True)
         self.processing_thread.start()
         self.current_buffer = EpisodeBuffer(gamma=0.9995)
@@ -780,7 +842,7 @@ class GameBuffer(EpisodeBuffer):
         super().__init__(gamma=gamma)
         self.lookback = lookback
         
-    def process_game_over(self, reward, move_buffer):
+    def process_game_over(self, reward, move_buffer, lines_cleared):
         """Process game over by distributing negative reward across recent moves"""
         # Get last n moves that led to game over
         n = min(self.lookback, len(move_buffer))
@@ -788,6 +850,8 @@ class GameBuffer(EpisodeBuffer):
             return
             
         states, actions, next_states, dones = move_buffer.get_last_n(n)
+        # Add 100 * lines_cleared to reward for each line cleared, with a max reward of 0
+        reward = min(10, reward + 100 * lines_cleared)
         reward_per_move = reward / n  # Distribute reward across moves
         
         # Add moves to episode buffer with distributed reward
@@ -817,6 +881,12 @@ class GameBuffer(EpisodeBuffer):
                 move_buffer.next_states[i],
                 move_buffer.dones[i]
             )
+
+def cleanup(env, display_manager=None, display_enabled=False):
+    env.close()
+    torch.cuda.empty_cache()
+    if display_manager is not None:
+        display_manager.stop()
 
 def main(
     resume=False,
@@ -1072,7 +1142,7 @@ def main(
                                             if env.game_state.game_over:
                                                 normalized_reward -= 100
                                                 # Process game over sequence
-                                                game_buffer.process_game_over(normalized_reward, move_buffer)
+                                                game_buffer.process_game_over(normalized_reward, move_buffer, env.game_state.lines_cleared)
                                             else:
                                                 # Process regular reward sequence
                                                 game_buffer.process_move_sequence(move_buffer, normalized_reward)
@@ -1362,6 +1432,5 @@ if __name__ == "__main__":
         level=args.level,
         level_inc=args.level_inc,
         cycles=args.cycles,
-        debug=args.debug,
-        display_enabled=False
+        debug=args.debug
     )

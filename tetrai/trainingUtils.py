@@ -6,6 +6,7 @@ import queue
 import cv2
 import moderngl
 import numpy as np
+import torch
 
 class DisplayManager:
     def __init__(self, width=512, height=512, title="Tetris Training"):
@@ -146,11 +147,11 @@ class DisplayManager:
         glfw.destroy_window(self.window)
         glfw.terminate()
 
-    def update(self, frame: np.ndarray):
-        """Update display with numpy array from TetrisEnv
+    def update(self, frame: torch.Tensor):
+        """Update display with torch tensor from TetrisEnv
         
         Args:
-            frame: numpy array of shape (H,W,3) in RGB format
+            frame: torch tensor of shape (H,W,3) in RGB format
         """
         if not self.running:
             return
@@ -163,20 +164,21 @@ class DisplayManager:
                 except queue.Empty:
                     break
                     
-            # Ensure frame is correct format
-            if frame.dtype != np.uint8:
-                frame = frame.astype(np.uint8)
+            # Convert to numpy only at the last moment for OpenGL
+            if frame.is_cuda:
+                frame = frame.cpu()
+            
+            # Ensure we're working with uint8
+            if frame.dtype != torch.uint8:
+                frame = (frame * 255).to(torch.uint8)
                 
-            # Frame should already be RGB from TetrisEnv
-            # Just verify shape is correct
+            # Handle different tensor shapes
             if len(frame.shape) == 2:
-                # Convert grayscale to RGB
-                frame = np.stack((frame,)*3, axis=-1)
-            elif frame.shape[2] == 4:
-                # Remove alpha channel if present
-                frame = frame[:,:,:3]
+                frame = frame.unsqueeze(-1).repeat(1, 1, 3)
+            elif frame.shape[-1] == 4:
+                frame = frame[...,:3]
                 
-            self.queue.put(frame)
+            self.queue.put(frame.numpy())
             
         except Exception as e:
             print(f"Error in display update: {e}")

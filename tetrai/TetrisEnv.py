@@ -8,6 +8,9 @@ import threading
 import multiprocessing
 
 import torch
+import torchvision.transforms as T
+import torchvision.utils as vutils
+import torch.nn.functional as F
 import cupy as cp
 from numba import jit, cuda
 from functools import lru_cache
@@ -26,41 +29,41 @@ BOARD_MARGIN = 20
 WHITE = (255, 255, 255)
 BLACK = (0, 0, 0)
 
-# Define piece IDs
+# Correct piece IDs to match standard Tetris colors
 PIECE_IDS = {
-    'I': 1,
-    'J': 2,
-    'L': 3,
-    'O': 4,
-    'S': 5,
-    'T': 6,
-    'Z': 7
+    'I': 1,  # Cyan (light blue)
+    'O': 2,  # Yellow
+    'T': 3,  # Purple
+    'S': 4,  # Green
+    'Z': 5,  # Red
+    'J': 6,  # Blue
+    'L': 7,  # Orange
 }
 
-# Define colors for each shape
+# Define colors for each shape (maintaining standard Tetris colors)
 COLORS = {
-    1: (0, 255, 255),    # Cyan
-    2: (0, 0, 255),      # Blue
-    3: (255, 165, 0),    # Orange
-    4: (255, 255, 0),    # Yellow
-    5: (0, 255, 0),      # Green
-    6: (128, 0, 128),    # Purple
-    7: (255, 0, 0)       # Red
+    1: (0, 255, 255),    # Cyan (I)
+    2: (255, 255, 0),    # Yellow (O)
+    3: (128, 0, 128),    # Purple (T)
+    4: (0, 255, 0),      # Green (S)
+    5: (255, 0, 0),      # Red (Z)
+    6: (0, 0, 255),      # Blue (J)
+    7: (255, 165, 0),    # Orange (L)
 }
 
 SECONDARY_COLORS = {
-    1: (0, 200, 200),    # Cyan
-    2: (0, 0, 200),      # Blue
-    3: (200, 100, 0),    # Orange
-    4: (200, 200, 0),    # Yellow
-    5: (0, 200, 0),      # Green
-    6: (100, 0, 100),    # Purple
-    7: (200, 0, 0)       # Red
+    1: (0, 200, 200),    # Cyan (I)
+    2: (200, 200, 0),    # Yellow (O)
+    3: (100, 0, 100),    # Purple (T)
+    4: (0, 200, 0),      # Green (S)
+    5: (200, 0, 0),      # Red (Z)
+    6: (0, 0, 200),      # Blue (J)
+    7: (200, 100, 0),    # Orange (L)
 }
 
-# Update shapes with rotation states (using SRS)
+# Update SHAPES to match PIECE_IDS order
 SHAPES = {
-    'I': [
+    'I': [   # ID: 1 - Cyan
         [[0, 0, 0, 0],
          [1, 1, 1, 1],
          [0, 0, 0, 0],
@@ -78,35 +81,7 @@ SHAPES = {
          [0, 1, 0, 0],
          [0, 1, 0, 0]]
     ],
-    'J': [
-        [[1, 0, 0],
-         [1, 1, 1],
-         [0, 0, 0]],
-        [[0, 1, 1],
-         [0, 1, 0],
-         [0, 1, 0]],
-        [[0, 0, 0],
-         [1, 1, 1],
-         [0, 0, 1]],
-        [[0, 1, 0],
-         [0, 1, 0],
-         [1, 1, 0]]
-    ],
-    'L': [
-        [[0, 0, 1],
-         [1, 1, 1],
-         [0, 0, 0]],
-        [[0, 1, 0],
-         [0, 1, 0],
-         [0, 1, 1]],
-        [[0, 0, 0],
-         [1, 1, 1],
-         [1, 0, 0]],
-        [[1, 1, 0],
-         [0, 1, 0],
-         [0, 1, 0]]
-    ],
-    'O': [
+    'O': [   # ID: 2 - Yellow
         [[1, 1],
          [1, 1]],
         [[1, 1],
@@ -116,7 +91,21 @@ SHAPES = {
         [[1, 1],
          [1, 1]]
     ],
-    'S': [
+    'T': [   # ID: 3 - Purple
+        [[0, 1, 0],
+         [1, 1, 1],
+         [0, 0, 0]],
+        [[0, 1, 0],
+         [0, 1, 1],
+         [0, 1, 0]],
+        [[0, 0, 0],
+         [1, 1, 1],
+         [0, 1, 0]],
+        [[0, 1, 0],
+         [1, 1, 0],
+         [0, 1, 0]]
+    ],
+    'S': [   # ID: 4 - Green
         [[0, 1, 1],
          [1, 1, 0],
          [0, 0, 0]],
@@ -130,21 +119,7 @@ SHAPES = {
          [1, 1, 0],
          [0, 1, 0]]
     ],
-    'T': [
-        [[0, 1, 0],
-         [1, 1, 1],
-         [0, 0, 0]],
-        [[0, 1, 0],
-         [0, 1, 1],
-         [0, 1, 0]],
-        [[0, 0, 0],
-         [1, 1, 1],
-         [0, 1, 0]],
-        [[0, 1, 0],
-         [1, 1, 0],
-         [0, 1, 0]]
-    ],
-    'Z': [
+    'Z': [   # ID: 5 - Red
         [[1, 1, 0],
          [0, 1, 1],
          [0, 0, 0]],
@@ -157,6 +132,34 @@ SHAPES = {
         [[0, 1, 0],
          [1, 1, 0],
          [1, 0, 0]]
+    ],
+    'J': [   # ID: 6 - Blue
+        [[1, 0, 0],
+         [1, 1, 1],
+         [0, 0, 0]],
+        [[0, 1, 1],
+         [0, 1, 0],
+         [0, 1, 0]],
+        [[0, 0, 0],
+         [1, 1, 1],
+         [0, 0, 1]],
+        [[0, 1, 0],
+         [0, 1, 0],
+         [1, 1, 0]]
+    ],
+    'L': [   # ID: 7 - Orange
+        [[0, 0, 1],
+         [1, 1, 1],
+         [0, 0, 0]],
+        [[0, 1, 0],
+         [0, 1, 0],
+         [0, 1, 1]],
+        [[0, 0, 0],
+         [1, 1, 1],
+         [1, 0, 0]],
+        [[1, 1, 0],
+         [0, 1, 0],
+         [0, 1, 0]]
     ]
 }
 
@@ -427,6 +430,338 @@ class GameState:
             
         return num_cleared
 
+class TorchRenderer:
+    def __init__(self, width, height, block_size, device='cuda'):
+        self.width = width
+        self.height = height
+        self.block_size = block_size
+        self.device = device
+
+        # Pre-compute side panel dimensions
+        self.board_x = SCREEN_WIDTH // 2 - (BOARD_WIDTH * BLOCK_SIZE) // 2
+        self.board_y = SCREEN_HEIGHT - (BOARD_HEIGHT * BLOCK_SIZE) - BOARD_MARGIN
+        self.side_panel_left = self.board_x - 160  # Move left panel even further left
+        self.side_panel_right = self.board_x + (BOARD_WIDTH * BLOCK_SIZE) + 20  # Right panel x position
+        self.panel_color = torch.tensor([30, 30, 30], dtype=torch.uint8, device=device)
+
+        # Add grid colors
+        self.grid_colors = {
+            'outer': torch.tensor([40, 40, 40], dtype=torch.uint8, device=device),
+            'inner': torch.tensor([0, 0, 0], dtype=torch.uint8, device=device)
+        }
+
+
+        # Pre-compute static elements
+        self.grid_template = self._create_grid_block_template()
+        self.static_background = self._create_static_background()
+        self.piece_templates = self._create_piece_templates()
+        self.grid_template = self._create_grid_template()
+        
+        # Create reusable tensor for the game board
+        self.board_tensor = torch.zeros((height, width, 3), 
+                                      dtype=torch.uint8, 
+                                      device=device)
+                                            
+        # Add piece offset lookup for centering
+        self.piece_offsets = {
+            'I': {'x': -0.5, 'y': 0.5},
+            'O': {'x': -0.5, 'y': 0.0},   # O piece needs special handling
+            'J': {'x': -0.5, 'y': 0.5},
+            'L': {'x': -0.5, 'y': 0.5},
+            'S': {'x': -0.5, 'y': 0.5},
+            'T': {'x': -0.5, 'y': 0.5},
+            'Z': {'x': -0.5, 'y': 0.5}
+        }
+        
+        # Convert color dictionaries to tensors
+        self.colors = {
+            k: torch.tensor(v, dtype=torch.uint8, device=device)
+            for k, v in COLORS.items()
+        }
+        self.secondary_colors = {
+            k: torch.tensor(v, dtype=torch.uint8, device=device)
+            for k, v in SECONDARY_COLORS.items()
+        }
+        
+        # Pre-allocate output tensor
+        self.output_tensor = torch.zeros(
+            (SCREEN_HEIGHT, SCREEN_WIDTH, 3),
+            dtype=torch.uint8,
+            device=device
+        )
+                
+    def _create_grid_block_template(self):
+        """Create a template for a single grid block"""
+        block = torch.zeros((BLOCK_SIZE, BLOCK_SIZE, 3), 
+                          dtype=torch.uint8,
+                          device=self.device)
+        
+        # Fill outer region with grid color
+        block[:, :] = self.grid_colors['outer']
+        
+        # Fill inner region with black
+        inner_margin = 2
+        block[inner_margin:-inner_margin, 
+             inner_margin:-inner_margin] = self.grid_colors['inner']
+            
+        return block
+
+    def _create_static_background(self):
+        """Create static background with grid pattern"""
+        background = torch.zeros((SCREEN_HEIGHT, SCREEN_WIDTH, 3), 
+                               dtype=torch.uint8, 
+                               device=self.device)
+        
+        # Calculate board region
+        board_height = BOARD_HEIGHT * BLOCK_SIZE
+        board_width = BOARD_WIDTH * BLOCK_SIZE
+        
+        # Draw grid blocks for the entire board area
+        for y in range(BOARD_HEIGHT):
+            for x in range(BOARD_WIDTH):
+                px = self.board_x + x * BLOCK_SIZE
+                py = self.board_y + y * BLOCK_SIZE
+                
+                if px + BLOCK_SIZE <= SCREEN_WIDTH and py + BLOCK_SIZE <= SCREEN_HEIGHT:
+                    background[py:py+BLOCK_SIZE, 
+                             px:px+BLOCK_SIZE] = self.grid_template
+        
+        # Draw side panel backgrounds (dark gray)
+        panel_width = 140
+        y_start = self.board_y + 15
+        y_end = self.board_y + 180
+        
+        # Left panel
+        background[y_start:y_end, 20:self.board_x-20] = self.panel_color
+
+        # Draw hold piece box border (white)
+        box_size = 4 * BLOCK_SIZE
+        hold_x = self.side_panel_left + 40
+        hold_y = self.board_y + 70
+        
+        # Draw box borders with white color
+        border_color = torch.tensor([255, 255, 255], dtype=torch.uint8, device=self.device)
+        border_thickness = 2
+        
+        # Draw horizontal lines
+        background[hold_y:hold_y+border_thickness, hold_x:hold_x+box_size] = border_color  # Top
+        background[hold_y+box_size-border_thickness:hold_y+box_size, hold_x:hold_x+box_size] = border_color  # Bottom
+        
+        # Draw vertical lines
+        background[hold_y:hold_y+box_size, hold_x:hold_x+border_thickness] = border_color  # Left
+        background[hold_y:hold_y+box_size, hold_x+box_size-border_thickness:hold_x+box_size] = border_color  # Right
+        
+        return background
+
+    def _create_grid_template(self):
+        """Create grid lines template including edges"""
+        # Calculate exact dimensions needed for the board region
+        board_height = BOARD_HEIGHT * BLOCK_SIZE + 2  # +2 for borders
+        board_width = BOARD_WIDTH * BLOCK_SIZE + 2   # +2 for borders
+        
+        grid = torch.zeros((board_height, board_width, 3),
+                          dtype=torch.uint8, 
+                          device=self.device)
+        
+        # Add grid lines (dark gray)
+        grid[::BLOCK_SIZE, :] = 40
+        grid[:, ::BLOCK_SIZE] = 40
+        
+        # Add consistent border lines
+        border_intensity = 60
+        grid[0:2, :] = border_intensity  # Top border
+        grid[-2:, :] = border_intensity  # Bottom border
+        grid[:, 0:2] = border_intensity  # Left border
+        grid[:, -2:] = border_intensity  # Right border
+        
+        return grid
+
+    def _create_piece_templates(self):
+        """Pre-compute piece templates for each color"""
+        templates = {}
+        for piece_type, piece_id in PIECE_IDS.items():
+            # Create block template with main color
+            block = torch.zeros((BLOCK_SIZE, BLOCK_SIZE, 3), 
+                              dtype=torch.uint8,
+                              device=self.device)
+            color = COLORS[piece_id]
+            # Convert RGB color to BGR
+            color = color[::-1]
+            
+            # Fill outer region with main color
+            block[:, :] = torch.tensor(color, 
+                                     dtype=torch.uint8,
+                                     device=self.device)
+            
+            # Fill inner region with secondary color
+            sec_color = SECONDARY_COLORS[piece_id]
+            sec_color = sec_color[::-1]
+            inner_margin = 2
+            block[inner_margin:-inner_margin, 
+                 inner_margin:-inner_margin] = torch.tensor(sec_color,
+                                                          dtype=torch.uint8,
+                                                          device=self.device)
+            
+            templates[piece_id] = block
+            
+        return templates
+
+    def render_held_piece(self, held_piece, output):
+        """Render held piece in the left panel with proper centering"""
+        if held_piece:
+            piece_id = PIECE_IDS[held_piece['type']]
+            shape = held_piece['shape'][0]  # Use first rotation
+            
+            # Calculate box dimensions
+            box_size = 4 * BLOCK_SIZE
+            hold_x = self.side_panel_left + 50  # Moved further left
+            hold_y = self.board_y + 70
+            
+            # Calculate piece dimensions
+            piece_height = len(shape)
+            piece_width = len(shape[0])
+            
+            # Get piece specific offsets
+            offset = self.piece_offsets[held_piece['type']]
+            
+            # Calculate centering offsets (convert to integers)
+            preview_block_size = int(BLOCK_SIZE * 0.8)
+            center_x = int(hold_x + (box_size - piece_width * preview_block_size) / 2)
+            center_y = int(hold_y + (box_size - piece_height * preview_block_size) / 2)
+            
+            # Apply piece-specific adjustments (convert to integers)
+            center_x += int(offset['x'] * preview_block_size)
+            center_y += int(offset['y'] * preview_block_size)
+            
+            # Render piece with calculated position
+            self._render_piece_preview(output, shape, piece_id, center_x, center_y)
+
+    def render_next_pieces(self, next_pieces, output):
+        """Render next pieces preview in the right panel"""
+        for i, piece in enumerate(next_pieces[:5]):  # Show up to 5 next pieces
+            piece_id = PIECE_IDS[piece['type']]
+            shape = piece['shape'][0]  # Use first rotation
+            
+            # Calculate position for each next piece
+            next_x = self.side_panel_right + 10
+            next_y = self.board_y + 60 + i * 60
+            
+            self._render_piece_preview(output, shape, piece_id, next_x, next_y)
+
+    def _render_piece_preview(self, output, shape, piece_id, x, y):
+        """Optimized piece preview rendering using tensor operations"""
+        template = self.piece_templates[piece_id]
+        preview_block_size = int(BLOCK_SIZE * 0.8)
+        
+        # Convert shape to tensor if not already
+        if not isinstance(shape, torch.Tensor):
+            shape = torch.tensor(shape, device=self.device)
+            
+        # Get piece positions
+        positions = torch.nonzero(shape)
+        if len(positions) > 0:
+            rows, cols = positions[:, 0], positions[:, 1]
+            
+            # Calculate preview positions
+            px = x + cols * preview_block_size
+            py = y + rows * preview_block_size
+            
+            # Create resized template once
+            preview_template = F.interpolate(
+                template.permute(2,0,1).unsqueeze(0).float(),
+                size=(preview_block_size, preview_block_size),
+                mode='nearest'
+            ).squeeze(0).permute(1,2,0).to(torch.uint8)
+            
+            # Draw preview blocks
+            for px_i, py_i in zip(px, py):
+                x1, y1 = px_i.item(), py_i.item()
+                if (y1 < output.shape[0] - preview_block_size and 
+                    x1 < output.shape[1] - preview_block_size):
+                    output[
+                        y1:y1+preview_block_size,
+                        x1:x1+preview_block_size
+                    ] = preview_template
+
+    def render_board(self, board_state, current_piece, position, held_piece=None, next_pieces=None):
+        """Render the full game state to a tensor"""
+        # Reset output tensor
+        self.output_tensor.zero_()
+        
+        # Copy static background with grid
+        self.output_tensor.copy_(self.static_background)
+        
+        # Render board state using tensor operations
+        with torch.amp.autocast(device_type='cuda'):
+            # Get non-zero positions in board
+            positions = torch.nonzero(board_state)
+            if len(positions) > 0:
+                rows, cols = positions[:, 0], positions[:, 1]
+                piece_ids = board_state[rows, cols]
+                
+                # Calculate pixel coordinates
+                px = self.board_x + cols * BLOCK_SIZE
+                py = self.board_y + rows * BLOCK_SIZE
+                
+                # Draw blocks efficiently using tensor operations
+                for idx, (piece_id, x, y) in enumerate(zip(piece_ids, px, py)):
+                    template = self.piece_templates[piece_id.item()]
+                    self.output_tensor[
+                        y:y+BLOCK_SIZE,
+                        x:x+BLOCK_SIZE
+                    ] = template
+        
+            # Render current piece
+            if current_piece:
+                shape = torch.tensor(
+                    current_piece['shape'][position[2]],
+                    device=self.device
+                )
+                piece_id = PIECE_IDS[current_piece['type']]
+                template = self.piece_templates[piece_id]
+                
+                # Get piece positions
+                piece_pos = torch.nonzero(shape)
+                if len(piece_pos) > 0:
+                    # Fix: Correct tuple unpacking
+                    rows, cols = piece_pos[:, 0], piece_pos[:, 1]
+                    
+                    # Calculate board positions
+                    board_x = position[1] + cols
+                    board_y = position[0] + rows
+                    
+                    # Filter valid positions
+                    valid_mask = board_y >= 0
+                    board_x = board_x[valid_mask]
+                    board_y = board_y[valid_mask]
+                    
+                    # Calculate pixel coordinates
+                    px = self.board_x + board_x * BLOCK_SIZE
+                    py = self.board_y + board_y * BLOCK_SIZE
+                    
+                    # Draw piece blocks
+                    for x, y in zip(px, py):
+                        self.output_tensor[
+                            y:y+BLOCK_SIZE,
+                            x:x+BLOCK_SIZE
+                        ] = template
+        
+        # Render UI elements using existing methods
+        self.render_held_piece(held_piece, self.output_tensor)
+        self.render_next_pieces(next_pieces, self.output_tensor)
+        
+        return self.output_tensor
+
+    def _draw_block(self, target, x, y, template):
+        """Draw a block template at the given board coordinates"""
+        start_x = self.board_x + x * BLOCK_SIZE
+        start_y = self.board_y + y * BLOCK_SIZE
+        end_x = start_x + BLOCK_SIZE
+        end_y = start_y + BLOCK_SIZE
+        
+        target[start_y:end_y, start_x:end_x] = template
+
+# Modify TetrisEnv class to use TorchRenderer
 class TetrisEnv:
     def __init__(self, display_manager=None, max_moves=-1, weights=None, manual=False, level=1):
         try:
@@ -504,6 +839,10 @@ class TetrisEnv:
 
         # Pre render the static elements of the baord
         self.static_background = self.render_static_background()
+
+        # Replace pygame screen with torch renderer
+        self.renderer = TorchRenderer(SCREEN_WIDTH, SCREEN_HEIGHT, BLOCK_SIZE)
+        self.render_delay = 100
 
     def render_static_background(self) -> Surface:
         static_background = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT))
@@ -745,7 +1084,7 @@ class TetrisEnv:
         # Check if piece can move down
         if self.game_state.valid_position(adj_y=1):
             # Only move down if enough time has passed
-            if time_delta > self.fall_speed * 1000:
+            if (time_delta > self.fall_speed * 1000):
                 self.game_state.position[0] += 1
                 self.last_move_time = current_time
                 self.game_state.is_landing = False
@@ -794,89 +1133,24 @@ class TetrisEnv:
         bumpiness = sum(abs(heights[i] - heights[i+1]) for i in range(len(heights)-1))
         return bumpiness
 
-    def get_state(self) -> np.ndarray:
-        """Get game state as visual representation optimized for GPU
+    def get_state(self) -> torch.Tensor:
+        """Get game state as visual representation"""
+        # Render using torch renderer with all game elements
+        board_tensor = self.renderer.render_board(
+            self.game_state.board,
+            self.game_state.current_piece,
+            [self.game_state.position[0], 
+             self.game_state.position[1],
+             self.game_state.rotation_index],
+            held_piece=self.game_state.hold_piece,
+            next_pieces=self.game_state.next_pieces
+        )
         
-        Returns:
-            np.ndarray: Visual state representation (HEIGHT, WIDTH, 3)
-        """
-        # Use pre-allocated surface
-        self.screen.blit(self.static_background, (0, 0))
-        
-        # Convert board state to CPU for drawing
-        board_array = self.game_state.board.cpu().numpy()
-        
-        # Batch draw board cells
-        board_positions = []
-        board_colors = []
-        board_secondary_colors = []
-        
-        for y in range(BOARD_HEIGHT):
-            for x in range(BOARD_WIDTH):
-                if board_array[y][x]:
-                    rect = (self.board_x + x * BLOCK_SIZE, 
-                        self.board_y + y * BLOCK_SIZE,
-                        BLOCK_SIZE, BLOCK_SIZE)
-                    board_positions.append(rect)
-                    board_colors.append(COLORS[board_array[y][x]])
-                    board_secondary_colors.append(SECONDARY_COLORS[board_array[y][x]])
-                
-        # Draw filled cells in batches
-        for rect, color, sec_color in zip(board_positions, board_colors, board_secondary_colors):
-            pygame.draw.rect(self.screen, color, rect)
-            inner_rect = (rect[0] + 2, rect[1] + 2, BLOCK_SIZE - 4, BLOCK_SIZE - 4)
-            pygame.draw.rect(self.screen, sec_color, inner_rect)
-        
-        # Draw current piece efficiently
-        shape = self.game_state.current_piece['shape'][self.game_state.rotation_index]
-        piece_id = PIECE_IDS[self.game_state.current_piece['type']]
-        border_color = COLORS[piece_id]
-        color = SECONDARY_COLORS[piece_id]
-        
-        # Batch piece drawing
-        piece_positions = []
-        for y, row in enumerate(shape):
-            for x, cell in enumerate(row):
-                if cell:
-                    px = self.board_x + (self.game_state.position[1] + x) * BLOCK_SIZE
-                    py = self.board_y + (self.game_state.position[0] + y) * BLOCK_SIZE
-                    if py >= self.board_y:
-                        piece_positions.append((px, py))
-        
-        # Draw piece borders and fills in batches
-        for px, py in piece_positions:
-            border = pygame.Rect(px, py, BLOCK_SIZE, BLOCK_SIZE)
-            pygame.draw.rect(self.screen, border_color, border)
-            rect = pygame.Rect(px + 2, py + 2, BLOCK_SIZE - 4, BLOCK_SIZE - 4)
-            pygame.draw.rect(self.screen, color, rect)
-        
-        if self.game_state.hold_piece:
-            self.draw_small_piece(
-                self.game_state.hold_piece,
-                (self.side_panel_x_left - self.side_panel_width_left + 50, self.board_y + 110),
-                self.screen
-            )
-                
-        # Draw next pieces efficiently
-        for i, piece in enumerate(self.game_state.next_pieces[:5]):
-            self.draw_small_piece(
-                piece,
-                (self.side_panel_x_right + 40, self.board_y + 65 + i * 60),
-                self.screen
-            )
-        
-        # Convert surface to numpy array efficiently
-        image = pygame.surfarray.array3d(self.screen)
-        image = np.flip(image, axis=0)  # Flip vertically 
-        image = np.rot90(image, -1, axes=(0, 1))
-
         if self.display_manager:
-            self.display_manager.update(image.copy())
-        
-        # Convert to grayscale using optimized numpy operations
-        image = np.mean(image, axis=2, dtype=np.uint8)
-
-        return image
+            self.display_manager.update(board_tensor)
+            
+        # Convert to grayscale using tensor operations
+        return torch.mean(board_tensor.float(), dim=2).to(torch.uint8)
 
     def render(self):
         with self.lock:

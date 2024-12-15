@@ -39,3 +39,18 @@ python tetrai/PPOonCNN.py --num_episodes 2000 --max_moves 200 --weights 'E:\Codi
 ```bash
 python tetrai/DDQNonCNN.py --num_episodes 10000 --max_moves 40 --weights 'E:\CodingProjects\tetrai\tetrai\reward_only.json' --save_interval 250 --cycles 16 --learning_rate .0001 --resume True --policy_net 'E:\CodingProjects\tetrai\out\1734167643\tetris_policy_net_500.pth' --target_net 'E:\CodingProjects\tetrai\out\1734167643\tetris_target_net_500.pth' --level_inc 3000
 ```
+
+This is temporary:
+```
+    # Debug output - save SINGLE FRAME, not stacked frames
+            # if len(states) > 0:
+            #     # Save the original resized frame before stacking
+            #     debug_frame = gpu_tensor[0] if not frame_stack else gpu_tensor[0, -1]
+                
+            #     # Convert to image format - ensure proper scaling
+            #     image = debug_frame.cpu().numpy()
+            #     if image.max() <= 1.0:  # If normalized
+            #         image = (image * 255).clip(0, 255)
+            #     image = image.astype(np.uint8)
+            #     Image.fromarray(image).save(f'out/{int(time.time())}.png')
+```

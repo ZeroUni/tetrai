@@ -56,3 +56,4 @@ venv.bak/
 .vscode/
 bestweights.txt
 tetrai/*.json
+pytorch/
