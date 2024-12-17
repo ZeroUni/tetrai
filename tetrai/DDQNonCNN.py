@@ -1000,7 +1000,7 @@ def main(
     temp_decay = 0.995
 
     # Modified epsilon parameters
-    epsilon_start = 1.0
+    epsilon_start = 1.0 # 9 / 10 moves will be optimal at the start
     epsilon_end = 0.01
     epsilon = epsilon_start
     epsilon_decay_end = 0.8  # Point in cycle where epsilon reaches minimum
@@ -1106,8 +1106,10 @@ def main(
                                         
                                         # Epsilon-greedy with legal action masking
                                         if random.random() < epsilon:
-                                            legal_actions = env.get_legal_actions()
-                                            action = random.choice(legal_actions)
+                                            # legal_actions = env.get_legal_actions()
+                                            # action = random.choice(legal_actions)
+                                            action = env.get_best_action() # Aid the model in its exploration phase
+                                            print(f'Random action: {action}')
                                         else:
                                             with torch.no_grad():
                                                 # Get Q-values by computing expected values from distributions
