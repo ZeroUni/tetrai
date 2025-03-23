@@ -284,46 +284,26 @@ def validate_move(board: torch.Tensor, piece: torch.Tensor, position: List[int],
     return not torch.any(board[board_y, board_x] != 0)
 
 @torch.jit.script
-def calc_fill_reward(board) -> float:
-    """Calculate reward for filling rows"""
-    fill_reward = 0.
-    for row in range(20):
-        fill_reward += int(torch.sum(board[row] > 0).item()) ** 2
-    return fill_reward
-
-@torch.jit.script
-def calc_fill_batch(boards: torch.Tensor) -> torch.Tensor:
-    """Calculate fill rewards for multiple boards"""
-    rewards = torch.zeros(boards.size(0), device='cuda')
-    for i in range(boards.size(0)):
-        rewards[i] = calc_fill_reward(boards[i])
-    return rewards
-
-@torch.jit.script
 def evaluate_positions_batch(boards: torch.Tensor, heights: torch.Tensor) -> torch.Tensor:
     """Evaluate multiple board positions"""
     batch_size = boards.size(0)
     scores = torch.zeros(batch_size, device='cuda')
     
-    # Calculate aggregate features
-    max_heights = torch.max(heights, dim=1)[0].float()
-    avg_heights = torch.mean(heights.float(), dim=1)
-    bumpiness = torch.sum(torch.abs(heights[:, :-1] - heights[:, 1:]).float(), dim=1)
+    # Count features
+    row_sums = torch.sum(boards != 0, dim=2)
+    lines = torch.sum(row_sums == boards.size(2), dim=1)
+    bumpiness = torch.sum(torch.abs(heights[:, :-1] - heights[:, 1:]), dim=1)
+    max_height = torch.max(heights, dim=1)[0]
+    max_row_fill_levels = torch.max(row_sums, dim=1)[0]
         
-    # Count filled cells and complete lines
-    filled = calc_fill_batch(boards)
-    # For each board, set the number of complete lines to be equal to the number of rows with no 0s
-    complete_lines = torch.sum(torch.all(boards != 0, dim=1).float(), dim=1)
-    
-    # Rebalanced weights with aggressive height control
+    # Balanced weights
     scores = (
-        complete_lines * 500.0 +  
-        filled * 10.0 - 
-        torch.pow(max_heights, 2.0) * 50.0 -  
-        avg_heights * 10.0 -  
-        bumpiness * 5.0  
+        lines * .49 +  # Heavily reward line clears
+        max_row_fill_levels * .16 +  # Prioritize filling rows
+        -max_height * .31 +  # Penalize height but not too much
+        -bumpiness * 0.2  # Minor penalty for unevenness
     )
-        
+    
     return scores
 
 # Add new utility functions at the top level
@@ -403,6 +383,9 @@ class GameState:
         self.is_landing = False
         self.actions_per_piece = 0
         self.give_reward = False
+
+        self.landing_moves = 0
+        self.max_landing_moves = 15
 
         # Add new fields for target tracking
         self.target_x = None
@@ -494,6 +477,7 @@ class GameState:
         self.is_landing = False
         self.lock_timer = 0
         self.actions_per_piece = 0
+        self.landing_moves = 0
 
         # Reset target position when piece locks
         self.target_x = None
@@ -918,6 +902,7 @@ class TetrisEnv:
         self.render_mode = False  # Set to False to run without rendering
         self.render_delay = 100  # Delay between renders in milliseconds
         self.last_render_time = pygame.time.get_ticks()
+        self.last_reward = 0 # So we can only reward the changes
 
         self.lock = threading.Lock()
         self.display_manager = display_manager
@@ -1022,6 +1007,8 @@ class TetrisEnv:
         with self.lock:
             reward = 0
             done = False
+            last_score = self.game_state.score
+            last_lines_cleared = self.game_state.lines_cleared
 
             # Apply action
             actions_per_piece = self.game_state.actions_per_piece
@@ -1032,12 +1019,14 @@ class TetrisEnv:
 
             # Calculate reward
             if self.game_state.give_reward:
-                reward += calculate_reward(self.game_state.board, self.game_state.score, self.game_state.lines_cleared, self.tensor_weights, BOARD_HEIGHT, BOARD_WIDTH, actions_per_piece)
+                calculated = calculate_reward(self.game_state.board, self.game_state.score - last_score, self.game_state.lines_cleared - last_lines_cleared, self.tensor_weights, BOARD_HEIGHT, BOARD_WIDTH, actions_per_piece)
+                reward += calculated
                 self.game_state.give_reward = False
+                # self.last_reward = calculated
 
             if self.game_state.game_over:
                 done = True
-                reward -= self.weights.get('game_over') or 1000  # Penalty for dying
+                reward = -self.weights.get('game_over') or -1000  # Penalty for dying
 
             self.move_count += 1
             if 0 < self.max_moves <= self.move_count:
@@ -1084,8 +1073,14 @@ class TetrisEnv:
                 return
 
         if moved and self.game_state.is_landing:
-            # Reset lock timer if the piece moved or rotated while landing
-            self.game_state.lock_timer = pygame.time.get_ticks()
+            self.game_state.landing_moves += 1
+
+            if self.game_state.landing_moves < self.game_state.max_landing_moves:
+                self.game_state.lock_timer = pygame.time.get_ticks()
+            else:
+                # Force lock after too many moves
+                if not self.game_state.valid_position(adj_y=1):
+                    self.game_state.lock_piece()
 
     def get_legal_actions(self) -> list:
         """Get list of legal actions in current state
@@ -1202,6 +1197,219 @@ class TetrisEnv:
                 return True
                 
         return False
+
+    def update_game_state(self):
+        current_time = pygame.time.get_ticks()
+        time_delta = current_time - self.last_move_time
+
+        # Check if piece can move down
+        if self.game_state.valid_position(adj_y=1):
+            # Only move down if enough time has passed
+            if (time_delta > self.fall_speed * 1000):
+                self.game_state.position[0] += 1
+                self.last_move_time = current_time
+                self.game_state.is_landing = False
+                self.game_state.lock_timer = 0
+        else:
+            # Piece can't move down - handle landing
+            if not self.game_state.is_landing:
+                # Start landing sequence
+                self.game_state.is_landing = True
+                self.game_state.lock_timer = current_time
+                self.game_state.landing_moves = 0
+            elif (current_time - self.game_state.lock_timer >= self.game_state.lock_delay or 
+                self.game_state.landing_moves >= self.game_state.max_landing_moves):
+                # Lock delay expired - lock the piece
+                if not self.game_state.valid_position(adj_y=1):  # Double check we can't move down
+                    self.game_state.lock_piece()
+                    self.last_move_time = current_time  # Reset fall timer
+                else:
+                    # If we can suddenly move down again, cancel landing
+                    self.game_state.is_landing = False
+                    self.game_state.lock_timer = 0
+
+        if self.render_mode and self.manual:
+            self.render()
+            self.clock.tick(60)
+
+    @lru_cache(maxsize=1)
+    def get_board_height(self) -> int:
+        """Get current board height with caching
+        
+        Returns:
+            int: Height of highest block
+        """
+        heights = torch.argmax(self.board != 0, dim=0)
+        return int(BOARD_HEIGHT - torch.min(heights).item())
+
+    def get_fill_level(self, row: int) -> int:
+        return sum(self.game_state.board[row] > 0)
+    
+    def reward_for_fill_level(self, row: int) -> int:
+        fill_level = self.get_fill_level(row)
+        if fill_level > 3:
+            return fill_level ** 2
+        return 0
+        
+    def calculate_bumpiness(self):
+        heights = [BOARD_HEIGHT - np.argmax(self.game_state.board[:, x]) if np.any(self.game_state.board[:, x]) else 0 for x in range(BOARD_WIDTH)]
+        bumpiness = sum(abs(heights[i] - heights[i+1]) for i in range(len(heights)-1))
+        return bumpiness
+
+    def get_state(self) -> torch.Tensor:
+        """Get game state as visual representation"""
+        # Render using torch renderer with all game elements
+        board_tensor = self.renderer.render_board(
+            self.game_state.board,
+            self.game_state.current_piece,
+            [self.game_state.position[0], 
+             self.game_state.position[1],
+             self.game_state.rotation_index],
+            held_piece=self.game_state.hold_piece,
+            next_pieces=self.game_state.next_pieces
+        )
+        
+        if self.display_manager:
+            self.display_manager.update(board_tensor)
+            
+        # Convert to grayscale using tensor operations
+        return torch.mean(board_tensor.float(), dim=2).to(torch.uint8)
+
+    def render(self):
+        with self.lock:
+            if not self.manual:
+                return
+
+            # Use our state func to get the image to draw
+            state = self.get_state()
+            # Display the pygame screen
+            pygame.display.flip()
+
+    def draw_small_piece(self, piece, center, surface):
+        """Simplified piece rendering with pre-calculated patterns"""
+        type = piece['type']
+        pattern = SHAPES[type][0]  # Use first rotation state
+        color = SECONDARY_COLORS[PIECE_IDS[type]]
+        border_color = COLORS[PIECE_IDS[type]]
+        small_block_size = BLOCK_SIZE // 1.5
+        small_block_border = BLOCK_SIZE // 1.6
+
+        for i, row in enumerate(pattern):
+            for j, cell in enumerate(row):
+                if cell:
+                    x = center[0] - small_block_border + j * small_block_border
+                    y = center[1] - small_block_border + i * small_block_border
+                    pygame.draw.rect(surface, border_color, (x, y, small_block_border, small_block_border))
+                    pygame.draw.rect(surface, color, (x + 1, y + 1, small_block_size, small_block_size))
+
+    def draw_text(self, text, position, surface):
+        font = pygame.font.SysFont('Arial', 24)
+        text_surface = font.render(text, True, WHITE)
+        surface.blit(text_surface, position)
+
+    def get_score(self) -> int:
+        return self.game_state.score
+
+    def close(self):
+        # Proper cleanup of CUDA resources
+        if hasattr(self, 'state_processor'):
+            self.state_processor.cpu()
+            del self.state_processor
+        if hasattr(self, 'state_tensor'):
+            del self.state_tensor
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        pygame.quit()
+        gc.collect()
+
+    def increase_level(self):
+        """Increase curriculum level if not at max"""
+        if self.level < 3:
+            self.level += 1
+            # Update game state with new level
+            self.game_state.level = self.level
+            return True
+        return False
+
+    def get_level(self) -> int:
+        """Get current curriculum level"""
+        return self.level
+
+    def simulate_drop(self, board, position, piece_shape):
+        """Simulate dropping a piece and return resulting board state"""
+        # Create a copy of the board for simulation
+        sim_board = board.clone()
+        
+        # Drop the piece until it hits something
+        while position[0] < BOARD_HEIGHT:
+            if not self.game_state.valid_position(piece=piece_shape, adj_y=1):
+                break
+            position[0] += 1
+            
+        # Place the piece on the simulated board
+        for y, row in enumerate(piece_shape):
+            for x, cell in enumerate(row):
+                if cell:
+                    new_y = position[0] + y
+                    new_x = position[1] + x
+                    if 0 <= new_y < BOARD_HEIGHT and 0 <= new_x < BOARD_WIDTH:
+                        sim_board[new_y][new_x] = 1
+                        
+        return sim_board
+
+    def evaluate_position(self, board):
+        """Evaluate a board position using heuristics"""
+        heights = calculate_heights(board, BOARD_HEIGHT)
+        holes = count_holes(board, heights, BOARD_HEIGHT, BOARD_WIDTH)
+        bumpiness = torch.sum(torch.abs(heights[:-1] - heights[1:]))
+        
+        # Check for line clears
+        lines = 0
+        for row in range(BOARD_HEIGHT):
+            if torch.all(board[row] != 0):
+                lines += 1
+                
+        # Weight the features
+        height_weight = -0.51
+        hole_weight = -0.36
+        bumpiness_weight = -0.18
+        line_weight = 0.76
+        
+        return (torch.max(heights).item() * height_weight + 
+                holes * hole_weight + 
+                bumpiness.item() * bumpiness_weight + 
+                lines * line_weight)
+
+    def get_best_action(self) -> int:
+        """Get best action using optimized CUDA-accelerated evaluation"""
+        # Convert piece shapes to tensor
+        piece_shapes = self.game_state.piece_tensors[self.game_state.current_piece['type']]
+        
+        # Call the optimized function
+        action, score, has_target, target_x, target_rot = find_best_move(
+            self.game_state.board,
+            piece_shapes,
+            self.game_state.position,
+            self.game_state.rotation_index,
+            BOARD_WIDTH,
+            BOARD_HEIGHT,
+            self.game_state.has_target,
+            self.game_state.target_x,
+            self.game_state.target_rot,
+            self.cuda_streams,
+            self.rotation_results
+        )
+        
+        # If the score is really bad, try holding the piece
+        if score < -10 and self.game_state.can_hold:
+            return 6  # Hold piece
+        
+        # Update target position tracking
+        self.game_state.has_target = has_target
+        self.game_state.target_x = target_x
+        self.game_state.target_rot = target_rot
+        
+        return action
 
     def update_game_state(self):
         current_time = pygame.time.get_ticks()
@@ -1383,206 +1591,6 @@ class TetrisEnv:
                 bumpiness.item() * bumpiness_weight + 
                 lines * line_weight)
 
-    def get_best_action(self) -> int:
-        """Get best action using cached target position"""
-        # Convert piece shapes to tensor first
-        piece_shapes = torch.tensor(self.game_state.current_piece['shape'], 
-                                dtype=torch.int8, 
-                                device='cuda')
-        
-        action, _, has_target, target_x, target_rot = find_best_move(
-            self.game_state.board,
-            piece_shapes,
-            self.game_state.position,
-            self.game_state.rotation_index,
-            BOARD_WIDTH, BOARD_HEIGHT,
-            self.game_state.has_target,
-            self.game_state.target_x,
-            self.game_state.target_rot,
-            self.cuda_streams,
-            self.rotation_results
-        )
-        
-        # Update cached target
-        self.game_state.has_target = has_target
-        self.game_state.target_x = target_x
-        self.game_state.target_rot = target_rot
-        
-        return action
-
-    def find_best_landing_position(self, piece_shape: torch.Tensor, curr_position: List[int], 
-                                 board: torch.Tensor) -> Tuple[torch.Tensor, int, int, float]:
-        """Optimized best position finding using batch operations"""
-        # Pre-allocate tensors for batch operations
-        max_positions = (BOARD_WIDTH + 4) * 4  # All x positions * rotations
-        test_boards = torch.zeros((max_positions, BOARD_HEIGHT, BOARD_WIDTH),
-                                dtype=torch.int8, device='cuda')
-        test_positions = torch.zeros((max_positions, 2), dtype=torch.int32, device='cuda')
-        test_pieces = torch.zeros((max_positions, 4, 4), dtype=torch.int8, device='cuda')
-        
-        # Generate all possible positions and rotations
-        valid_count = 0
-        for rotation in range(4):
-            rotated_shape = torch.tensor(piece_shape[rotation], device='cuda')
-            
-            for x in range(-2, BOARD_WIDTH + 2):
-                # Quick check if position could be valid
-                if (x + rotated_shape.size(1) <= 0 or 
-                    x >= BOARD_WIDTH):
-                    continue
-                
-                test_position = [0, x]
-                if validate_move(board, rotated_shape, test_position):
-                    test_positions[valid_count] = torch.tensor(test_position)
-                    test_pieces[valid_count, :rotated_shape.size(0), 
-                              :rotated_shape.size(1)] = rotated_shape
-                    valid_count += 1
-        
-        if valid_count == 0:
-            return None, curr_position[1], 0, float('-inf')
-            
-        # Simulate drops in batch
-        valid_boards, final_y = simulate_drops_batch(
-            board,
-            test_positions[:valid_count],
-            test_pieces[:valid_count]
-        )
-        
-        # Calculate heights for all positions
-        heights = calculate_heights_batch(valid_boards)
-        
-        # Evaluate all positions in parallel
-        scores = evaluate_positions_batch(valid_boards, heights)
-        
-        # Find best position
-        best_idx = torch.argmax(scores)
-        best_score = scores[best_idx]
-        best_position = test_positions[best_idx]
-        best_board = valid_boards[best_idx]
-        
-        return (best_board, int(best_position[1]), 
-                self._get_rotation_from_piece(test_pieces[best_idx]),
-                float(best_score))
-    
-    def _get_rotation_from_piece(self, piece: torch.Tensor) -> int:
-        """Determine rotation index from piece shape by comparing padded versions"""
-        # Get piece dimensions
-        max_size = 4  # Maximum piece size is 4x4
-        padded_piece = torch.zeros((max_size, max_size), dtype=torch.int8, device='cuda')
-        # Copy the actual piece into the padded tensor
-        padded_piece[:piece.size(0), :piece.size(1)] = piece
-        
-        # Compare with each possible rotation
-        for i, shape in enumerate(self.game_state.current_piece['shape']):
-            # Create padded version of the shape
-            padded_shape = torch.zeros((max_size, max_size), dtype=torch.int8, device='cuda')
-            shape_tensor = torch.tensor(shape, device='cuda')
-            padded_shape[:shape_tensor.size(0), :shape_tensor.size(1)] = shape_tensor
-            
-            if torch.all(padded_piece == padded_shape):
-                return i
-        return 0
-
-    def evaluate_position_detailed(self, board: torch.Tensor) -> float:
-        """Use batch evaluation for single position"""
-        return float(evaluate_positions_batch(
-            board.unsqueeze(0),
-            calculate_heights(board, BOARD_HEIGHT).unsqueeze(0)
-        )[0].item())
-
-    def find_best_landing_position(self, piece_shape: torch.Tensor, curr_position: List[int],
-                                 board: torch.Tensor) -> Tuple[torch.Tensor, int, int, float]:
-        """Optimized position finding using CUDA streams and batching"""
-        # Create CUDA streams for parallel processing
-        streams = [torch.cuda.Stream() for _ in range(4)]
-        
-        # Pre-allocate tensors for all possible positions
-        max_positions = (BOARD_WIDTH + 4) * 4
-        all_positions = torch.zeros((max_positions, 2), dtype=torch.int32, device='cuda')
-        all_pieces = torch.zeros((max_positions, 4, 4), dtype=torch.int8, device='cuda')
-        all_rotations = torch.zeros(max_positions, dtype=torch.int32, device='cuda')
-        
-        # Generate position candidates more efficiently
-        valid_count = 0
-        x_range = torch.arange(-2, BOARD_WIDTH + 2, device='cuda')
-        
-        # Quick pruning - only consider positions that could be valid
-        board_profile = torch.any(board != 0, dim=0)  # Get column occupancy
-        valid_cols = torch.where(~board_profile)[0]  # Find empty columns
-        if len(valid_cols) > 0:
-            min_x = max(-2, valid_cols[0].item() - 2)
-            max_x = min(BOARD_WIDTH + 2, valid_cols[-1].item() + 3)
-            x_range = x_range[min_x+2:max_x+2]
-        
-        futures = []
-        for rotation, stream in zip(range(4), streams):
-            with torch.cuda.stream(stream):
-                rotated_shape = torch.tensor(piece_shape[rotation], device='cuda')
-                
-                # Generate all x positions for this rotation
-                positions = torch.stack([
-                    torch.zeros_like(x_range),
-                    x_range
-                ], dim=1)
-                
-                # Batch validate all positions
-                valid_mask = batch_validate_moves(
-                    board,
-                    rotated_shape.unsqueeze(0).expand(len(x_range), -1, -1),
-                    positions
-                )
-                
-                # Record valid positions
-                valid_idx = torch.where(valid_mask)[0]
-                if len(valid_idx) > 0:
-                    count = len(valid_idx)
-                    slice_end = valid_count + count
-                    all_positions[valid_count:slice_end] = positions[valid_idx]
-                    all_pieces[valid_count:slice_end, :rotated_shape.size(0), 
-                              :rotated_shape.size(1)] = rotated_shape
-                    all_rotations[valid_count:slice_end] = rotation
-                    valid_count += count
-                    
-                futures.append(stream.record_event())
-        
-        # Synchronize streams
-        for future in futures:
-            future.wait()
-            
-        if valid_count == 0:
-            return None, curr_position[1], 0, float('-inf')
-            
-        # Process valid positions in batches
-        batch_size = 128  # Adjust based on GPU memory
-        best_score = float('-inf')
-        best_board = None
-        best_x = curr_position[1]
-        best_rotation = 0
-        
-        for i in range(0, valid_count, batch_size):
-            end_idx = min(i + batch_size, valid_count)
-            
-            # Simulate drops for batch
-            batch_boards, batch_y = simulate_drops_batch(
-                board,
-                all_positions[i:end_idx],
-                all_pieces[i:end_idx]
-            )
-            
-            # Calculate heights and evaluate positions
-            heights = calculate_heights_batch(batch_boards)
-            scores = evaluate_positions_batch(batch_boards, heights)
-            
-            # Update best position if better found
-            max_score, max_idx = torch.max(scores, dim=0)
-            if max_score > best_score:
-                best_score = max_score
-                best_board = batch_boards[max_idx]
-                best_x = int(all_positions[i + max_idx, 1].item())
-                best_rotation = int(all_rotations[i + max_idx].item())
-        
-        return best_board, best_x, best_rotation, float(best_score)
-
 @torch.jit.script
 def count_holes(board, heights, BOARD_HEIGHT: int, BOARD_WIDTH: int) -> int:
     """Count holes using DFS on GPU tensors
@@ -1668,11 +1676,23 @@ def calculate_heights_batch(boards: torch.Tensor) -> torch.Tensor:
     heights = torch.zeros((batch_size, boards.size(2)), 
                          dtype=torch.int32, device='cuda')
     
-    # Use our calc heights on each board
+    # Find first non-zero element from top for each column
     for b in range(batch_size):
-        heights[b] = calculate_heights(boards[b], boards.size(1))
+        board = boards[b]
+        for col in range(board.size(1)):
+            non_zero = torch.nonzero(board[:, col])
+            if len(non_zero) > 0:
+                heights[b, col] = board.size(0) - non_zero[0].item()
     
     return heights
+
+@torch.jit.script
+def calc_fill_reward(board, BOARD_HEIGHT: int, BOARD_WIDTH: int) -> float:
+    """Calculate reward for filling rows"""
+    fill_reward = 0.
+    for row in range(BOARD_HEIGHT):
+        fill_reward += int(torch.sum(board[row] > 0).item()) ** 2
+    return fill_reward
 
 @torch.jit.script
 def calculate_reward(board, score: int, lines: int, weights, BOARD_HEIGHT: int, BOARD_WIDTH: int, actions_taken: int) -> float:
@@ -1680,7 +1700,7 @@ def calculate_reward(board, score: int, lines: int, weights, BOARD_HEIGHT: int, 
     heights = calculate_heights(board, BOARD_HEIGHT)
     holes = torch.tensor(float(count_holes(board, heights, BOARD_HEIGHT, BOARD_WIDTH)), device='cuda')
     bumpiness = torch.tensor(float(torch.sum(torch.abs(heights[:-1] - heights[1:]).float()).item()), device='cuda')
-    fill_reward = torch.tensor(float(calc_fill_reward(board)), device='cuda')
+    fill_reward = torch.tensor(float(calc_fill_reward(board, BOARD_HEIGHT, BOARD_WIDTH)), device='cuda')
     max_height = torch.tensor(float(torch.max(heights).item()), device='cuda')
     # If the value of max_height is less than 4, set it to 0 to avoid penalizing low height
     max_height = torch.where(max_height < 5, torch.tensor(0, device='cuda'), max_height)
@@ -1711,13 +1731,22 @@ def calculate_reward(board, score: int, lines: int, weights, BOARD_HEIGHT: int, 
 @torch.jit.script
 def simulate_drops_batch(board: torch.Tensor, positions: torch.Tensor, 
                         pieces: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Simulate dropping multiple pieces in parallel"""
+    """Simulate dropping multiple pieces in parallel
+    
+    Args:
+        board: Current board state [H, W]
+        positions: Starting positions [[y, x], ...] [B, 2]
+        pieces: Piece shapes to drop [B, H, W]
+        
+    Returns:
+        Tuple of (resulting boards [B, H, W], final y positions [B])
+    """
     batch_size = positions.size(0)
-    # Create new boards with proper copying
-    boards = board.clone().expand(batch_size, -1, -1)  # Changed from expand+clone to clone+expand
+    # Fix dimension handling here - remove extra dimension
+    boards = board.expand(batch_size, -1, -1).clone()
     curr_positions = positions.clone()
     
-    # Drop pieces until they can't move down
+    # Rest of function remains the same
     while True:
         next_y = curr_positions[:, 0] + 1
         valid = torch.ones(batch_size, dtype=torch.bool, device='cuda')
@@ -1743,48 +1772,73 @@ def simulate_drops_batch(board: torch.Tensor, positions: torch.Tensor,
         piece = pieces[b]
         pos = curr_positions[b]
         y, x = int(pos[0]), int(pos[1])
-                
+        
         piece_mask = piece != 0
-        if torch.any(piece_mask):  # Only process if piece has content
-            board_slice = boards[b, y:y+piece.size(0), x:x+piece.size(1)]
-            if board_slice.size() == piece.size():
-                board_slice[piece_mask] = piece[piece_mask]
-    
+        piece_rows = torch.any(piece_mask, dim=1)
+        piece_cols = torch.any(piece_mask, dim=0)
+        
+        row_indices = torch.where(piece_rows)[0]
+        col_indices = torch.where(piece_cols)[0]
+        
+        if len(row_indices) > 0 and len(col_indices) > 0:
+            min_row, max_row = row_indices[0], row_indices[-1] + 1
+            min_col, max_col = col_indices[0], col_indices[-1] + 1
+            
+            actual_piece = piece[min_row:max_row, min_col:max_col]
+            actual_mask = piece_mask[min_row:max_row, min_col:max_col]
+            
+            board_y = y + min_row
+            board_x = x + min_col
+            
+            if (0 <= board_y < board.size(0) - (max_row - min_row) and 
+                0 <= board_x < board.size(1) - (max_col - min_col)):
+                boards[b, 
+                      board_y:board_y + actual_piece.size(0),
+                      board_x:board_x + actual_piece.size(1)][actual_mask] = 1
     
     return boards, curr_positions[:, 0]
 
 @torch.jit.script
 def prune_positions(board: torch.Tensor, piece_shape: torch.Tensor, 
                     x_positions: torch.Tensor, y_position: int) -> torch.Tensor:
-    """More strictly prune invalid positions"""
+    """Quickly prune obviously invalid positions in batch
+    
+    Args:
+        board: Current board state
+        piece_shape: Shape to test
+        x_positions: Tensor of x coordinates to test
+        y_position: Current y position
+        
+    Returns:
+        Boolean mask of valid positions
+    """
     piece_width = piece_shape.size(1)
     piece_height = piece_shape.size(0)
-    board_width = board.size(1)
     
-    # Stricter bounds check - ensure full piece is within board
-    valid = (x_positions >= 0) & (x_positions <= board_width - piece_width)
+    # Basic bounds check
+    valid = (x_positions >= -(piece_width-1)) & (x_positions < board.size(1))
     
     if not torch.any(valid):
-        return torch.zeros_like(x_positions, dtype=torch.bool, device='cuda')
-        
-    # Check each candidate position
-    valid_mask = torch.zeros_like(x_positions, dtype=torch.bool, device='cuda')
+        return valid
     
-    for i, x in enumerate(x_positions):
-        if not valid[i]:
-            continue
-            
-        # Get board region where piece would be
-        x_int = int(x.item())
-        board_region = board[y_position:y_position+piece_height, 
-                           x_int:x_int+piece_width]
-                           
-        # Only valid if no collision
-        if board_region.size() == piece_shape.size():
-            collision = torch.any((board_region != 0) & (piece_shape != 0))
-            valid_mask[i] = not collision
-            
-    return valid_mask
+    # Quick column height check
+    heights = calculate_heights(board, board.size(0))
+    min_heights = heights.roll(1, 0)
+    min_heights[0] = heights[0]
+    max_heights = heights.roll(-1, 0) 
+    max_heights[-1] = heights[-1]
+    
+    # For each valid x, check if piece could fit height-wise
+    valid_x = x_positions[valid]
+    for i, x in enumerate(valid_x):
+        x_idx = int(x.item())
+        if x_idx >= 0 and x_idx < board.size(1):
+            # Get relevant height range
+            local_max = torch.max(heights[max(0,x_idx-1):min(board.size(1),x_idx+2)])
+            if y_position + piece_height > local_max + 3:
+                valid[x_positions == x] = False
+                
+    return valid
 
 def find_best_move(board: torch.Tensor, piece_shapes: torch.Tensor,
                           position: List[int], rotation_index: int,

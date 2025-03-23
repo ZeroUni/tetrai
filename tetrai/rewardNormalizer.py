@@ -8,24 +8,35 @@ class RewardNormalizer:
         self.decay = decay
         self.epsilon = epsilon
 
+    def record(self, reward):
+        """Store reward without normalizing it"""
+        self.episode_rewards.append(reward)
+        return reward  # Return raw reward for now
+
     @torch.no_grad() 
     def normalize(self, reward):
-        """Normalize reward while preserving sign and relative magnitude"""
-        # Update running statistics
-        self.running_mean = self.decay * self.running_mean + (1 - self.decay) * reward
+        """Normalize all rewards in the episode using consistent statistics"""
+        if not self.episode_rewards:
+            return []
+            
+        # Convert stored rewards to tensor
+        rewards = torch.tensor(self.episode_rewards, device='cuda', dtype=torch.float32)
         
-        # Update running variance 
-        diff = reward - self.running_mean
-        self.running_var = self.decay * self.running_var + (1 - self.decay) * (diff ** 2)
+        # Update running statistics based on entire episode
+        episode_mean = rewards.mean()
+        episode_std = rewards.std() + self.epsilon
         
-        # Normalize using running statistics while preserving sign
-        std = torch.sqrt(self.running_var + self.epsilon)
-        normalized = diff / std
+        # Update running statistics with entire episode (optional)
+        self.running_mean = self.decay * self.running_mean + (1 - self.decay) * episode_mean
+        self.running_var = self.decay * self.running_var + (1 - self.decay) * (rewards.var() + self.epsilon)
         
-        # Apply soft clipping to preserve relative magnitudes
+        # Normalize using episode statistics
+        normalized = (rewards - episode_mean) / episode_std
+        
+        # Apply soft clipping
         normalized = torch.tanh(normalized / self.clip_limit) * self.clip_limit
         
-        return normalized
+        return normalized.tolist()
 
     def reset(self):
         """Reset statistics"""

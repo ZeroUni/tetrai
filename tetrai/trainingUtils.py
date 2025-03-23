@@ -7,15 +7,24 @@ import cv2
 import moderngl
 import numpy as np
 import torch
+import os
+import time
 
 class DisplayManager:
-    def __init__(self, width=512, height=512, title="Tetris Training"):
+    def __init__(self, width=512, height=512, title="Tetris Training", record_video=False):
         self.width = width
         self.height = height
         self.title = title
         self.queue = Queue()
         self.running = True
         self.display_thread = None
+
+        # Video recording
+        self.record_video = record_video
+        self.video_recorder = None
+        if record_video:
+            self.video_recorder = VideoRecorder(resolution=(width, height)).start()
+
 
         # OpenGL/GLFW initialization will happen in the display thread
         self.ctx = None
@@ -31,8 +40,12 @@ class DisplayManager:
         self.running = False
         if self.queue:
             self.queue.put(None)  # Signal to stop
+        
         if self.display_thread:
             self.display_thread.join()
+
+        if self.record_video and self.video_recorder:
+            self.video_recorder.stop()
 
     def _init_gl(self):
         # Initialize GLFW
@@ -177,8 +190,65 @@ class DisplayManager:
                 frame = frame.unsqueeze(-1).repeat(1, 1, 3)
             elif frame.shape[-1] == 4:
                 frame = frame[...,:3]
+
+            # Add to video recorder if enabled
+            if self.record_video and self.video_recorder:
+                self.video_recorder.add_frame(frame.numpy())
                 
             self.queue.put(frame.numpy())
             
         except Exception as e:
             print(f"Error in display update: {e}")
+
+class VideoRecorder:
+    def __init__(self, output_dir='out', fps=30, resolution=(512, 512)):
+        os.makedirs(output_dir, exist_ok=True)
+        self.output_file = f"{output_dir}/training_{int(time.time())}.mp4"
+        self.fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # or 'avc1' for H.264
+        self.fps = fps
+        self.resolution = resolution
+        self.writer = None
+        self.frame_count = 0
+        
+    def start(self):
+        self.writer = cv2.VideoWriter(
+            self.output_file, 
+            self.fourcc, 
+            self.fps, 
+            self.resolution
+        )
+        return self
+        
+    def add_frame(self, frame):
+        if self.writer is None:
+            self.start()
+            
+        # Convert torch tensor to numpy if needed
+        if torch.is_tensor(frame):
+            if frame.is_cuda:
+                frame = frame.cpu()
+            if frame.dtype != torch.uint8:
+                frame = (frame * 255).to(torch.uint8)
+            frame = frame.numpy()
+            
+        # Ensure correct shape and format for VideoWriter
+        if len(frame.shape) == 2:  # Grayscale
+            frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+        elif frame.shape[2] == 4:  # RGBA
+            frame = cv2.cvtColor(frame, cv2.COLOR_RGBA2BGR)
+        elif frame.shape[2] == 3 and frame.dtype != np.uint8:
+            frame = (frame * 255).astype(np.uint8)
+            
+        # Resize if needed
+        if frame.shape[:2] != self.resolution[::-1]:  # VideoWriter uses (width, height)
+            frame = cv2.resize(frame, self.resolution)
+            
+        self.writer.write(frame)
+        self.frame_count += 1
+        return self
+        
+    def stop(self):
+        if self.writer is not None:
+            self.writer.release()
+            print(f"Video saved to {self.output_file} ({self.frame_count} frames)")
+            self.writer = None
