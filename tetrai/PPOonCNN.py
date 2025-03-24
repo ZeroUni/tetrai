@@ -20,6 +20,9 @@ from rewardNormalizer import RewardNormalizer
 from trainingUtils import DisplayManager
 from streamingServer import TetrisStreamServer
 
+# Add import for TrainingDashboard
+from streamingServer import TrainingDashboard
+
 class PPOBuffer:
     def __init__(self, capacity=2048, gamma=0.99, lam=0.95, device='cuda'):
         self.states = []
@@ -263,6 +266,90 @@ class GameBuffer:
         self.recent_next_states.clear()
         self.recent_dones.clear()
 
+class TaskQueue:
+    """Thread-safe task queue for dynamic episode allocation"""
+    def __init__(self, total_episodes: int, min_batch_size: int = 1):
+        self.queue = queue.Queue()
+        self.remaining = total_episodes
+        self.completed = 0
+        self.in_progress = 0
+        self.min_batch_size = min_batch_size
+        self.lock = threading.Lock()
+        self.results = []
+        self.total_episodes = total_episodes  # Store the total episodes
+    
+    def initialize(self):
+        """Reset the queue for a new training iteration"""
+        with self.lock:
+            self.queue = queue.Queue()
+            self.in_progress = 0
+            self.completed = 0
+            # Don't reset total_episodes here
+    
+    def get_task(self) -> Optional[int]:
+        """Get the next task (number of episodes to process)
+        
+        Returns:
+            Number of episodes to process, or None if no more work
+        """
+        with self.lock:
+            if self.remaining <= 0:
+                return None
+                
+            # Dynamically determine batch size based on remaining episodes
+            # Start with smaller batches and increase when we have fewer workers
+            if self.in_progress > 0:
+                # If other workers are busy, take a smaller batch
+                batch_size = max(self.min_batch_size, min(3, self.remaining))
+            else:
+                # If we're the only/first worker, take a larger batch
+                batch_size = max(self.min_batch_size, min(5, self.remaining))
+            
+            # Ensure we don't exceed remaining episodes
+            batch_size = min(batch_size, self.remaining)
+            
+            if batch_size > 0:
+                self.remaining -= batch_size
+                self.in_progress += batch_size
+                return batch_size
+            return None
+    
+    def submit_result(self, num_episodes: int, rewards: List[float], steps: List[int]):
+        """Submit results from completed episodes"""
+        with self.lock:
+            self.completed += num_episodes
+            self.in_progress -= num_episodes
+            self.results.append((rewards, steps))
+    
+    def is_complete(self) -> bool:
+        """Check if all episodes have been completed"""
+        with self.lock:
+            return self.completed == self.total_episodes and self.in_progress == 0
+    
+    def get_results(self) -> Tuple[List[float], List[int]]:
+        """Get all collected results
+        
+        Returns:
+            Tuple of (rewards, steps)
+        """
+        all_rewards = []
+        all_steps = []
+        
+        for rewards, steps in self.results:
+            all_rewards.extend(rewards)
+            all_steps.extend(steps)
+            
+        return all_rewards, all_steps
+    
+    def get_progress(self) -> Tuple[int, int, int]:
+        """Get current progress
+        
+        Returns:
+            Tuple of (completed, in_progress, remaining)
+        """
+        with self.lock:
+            return self.completed, self.in_progress, self.remaining
+
 class Worker:
     """Worker for parallel data collection"""
     def __init__(self, 
@@ -275,6 +362,7 @@ class Worker:
                  level: int = 1,
                  display_manager: Optional[DisplayManager] = None,
                  record: bool = False,
+                 display_enabled: bool = True,  # Add this parameter
                  stream_port: Optional[int] = None,
                  debug: bool = False):
         self.worker_id = worker_id
@@ -284,12 +372,14 @@ class Worker:
         self.max_moves = max_moves
         self.debug = debug
         self.record = record
+        self.display_enabled = display_enabled  # Store display_enabled flag
         
-        # Create separate display manager for recording
+        # Create separate display manager for recording without visual display if display_enabled=False
         if self.record and display_manager is None:
             self.recording_manager = DisplayManager(
                 record_video=True,
-                video_filename=f"worker_{worker_id}"
+                video_filename=f"worker_{worker_id}",
+                headless=not display_enabled  # Always use headless mode when display_enabled is False
             )
             self.recording_manager.start()
         else:
@@ -305,7 +395,8 @@ class Worker:
             weights=weights, 
             level=level
         )
-        self.env.render_mode = self.display_manager is not None
+        # Only enable rendering if display is enabled and we have a display manager
+        self.env.render_mode = self.display_manager is not None and display_enabled
         
         # Create worker-specific buffers and helpers
         self.game_buffer = GameBuffer(shared_buffer, gamma=0.99, lookback=15)
@@ -427,40 +518,63 @@ class Worker:
         
         return episode_reward, episode_steps
         
-    def run_episodes_thread(self, num_episodes: int):
-        """Run multiple episodes in a separate thread"""
-        rewards = []
-        steps = []
+    def run_episodes_thread(self, task_queue: 'TaskQueue'):
+        """Run episodes from a shared task queue"""
+        # Create local references to frame_stack and preprocess_pool to prevent race conditions
+        frame_stack = self.frame_stack
+        preprocess_pool = self.preprocess_pool
         
-        for _ in range(num_episodes):
-            if not self.running:
+        while True:
+            # Try to get a task from the queue
+            num_episodes = task_queue.get_task()
+            if num_episodes is None:
                 break
                 
-            try:
-                reward, step_count = self.run_episode()
-                rewards.append(reward)
-                steps.append(step_count)
-                
-                # Clear CUDA cache periodically
-                if len(rewards) % 5 == 0:
-                    torch.cuda.empty_cache()
-            except Exception as e:
-                print(f"Worker {self.worker_id} error: {e}")
-                traceback.print_exc()
-                break
-        
-        # Put results in queue
-        self.result_queue.put((rewards, steps))
+            rewards = []
+            steps = []
+            
+            for _ in range(num_episodes):
+                if not self.running:
+                    # Submit any completed episodes
+                    if rewards:
+                        task_queue.submit_result(len(rewards), rewards, steps)
+                    return
+                    
+                try:
+                    # Use the local references instead of the instance variables
+                    if not hasattr(self, 'frame_stack') or self.frame_stack is None:
+                        print(f"Worker {self.worker_id}: Recreating frame stack")
+                        from DDQNonCNN import FrameStack, PreprocessingPool
+                        self.frame_stack = FrameStack(stack_size=4)
+                        self.preprocess_pool = PreprocessingPool(size=32)
+                        frame_stack = self.frame_stack
+                        preprocess_pool = self.preprocess_pool
+                    
+                    reward, step_count = self.run_episode()
+                    rewards.append(reward)
+                    steps.append(step_count)
+                    
+                    # Clear CUDA cache periodically
+                    if len(rewards) % 5 == 0:
+                        torch.cuda.empty_cache()
+                except Exception as e:
+                    print(f"Worker {self.worker_id} error: {e}")
+                    traceback.print_exc()
+                    break
+            
+            # Submit results for the completed batch
+            if rewards:
+                task_queue.submit_result(len(rewards), rewards, steps)
     
-    def start(self, num_episodes: int = 1):
-        """Start worker thread"""
+    def start_with_queue(self, task_queue: 'TaskQueue'):
+        """Start worker with a shared task queue"""
         if self.thread is not None and self.thread.is_alive():
             return
             
         self.running = True
         self.thread = threading.Thread(
             target=self.run_episodes_thread,
-            args=(num_episodes,),
+            args=(task_queue,),
             daemon=True
         )
         self.thread.start()
@@ -500,10 +614,23 @@ class Worker:
         if self.stream_server:
             self.stream_server.stop()
             
-        # Clear memory
-        del self.frame_stack
-        del self.preprocess_pool
-        del self.game_buffer
+        # Use a more careful approach to clearing memory
+        fs = self.frame_stack
+        pp = self.preprocess_pool
+        gb = self.game_buffer
+        
+        # Set to None first, then delete
+        self.frame_stack = None
+        self.preprocess_pool = None
+        self.game_buffer = None
+        
+        # Now delete the local references
+        try:
+            del fs
+            del pp
+            del gb
+        except Exception as e:
+            print(f"Error cleaning up Worker {self.worker_id} resources: {e}")
         
         torch.cuda.empty_cache()
 
@@ -529,6 +656,7 @@ class Worker:
                 )
                 self.env.render_mode = self.display_manager is not None
 
+# Fix the worker initialization in main function
 def main(
     num_episodes=1000,
     batch_size=64,
@@ -565,7 +693,7 @@ def main(
     # Initialize display manager if needed (only for display worker)
     display_manager = None
     if display_enabled:
-        display_manager = DisplayManager(record_video=record and display_worker == 0)
+        display_manager = DisplayManager(record_video=record and display_worker == 0, headless=False)
         display_manager.start()
     
     # Load weights for environment
@@ -607,11 +735,40 @@ def main(
     base_clip_ratio = clip_ratio
     min_clip_ratio = 0.05
     
+    # Initialize training dashboard if streaming is enabled
+    training_dashboard = None
+    if stream_base_port is not None:
+        training_dashboard = TrainingDashboard(base_port=stream_base_port)
+        training_dashboard.start()
+        
+        # Set initial stats with complete training parameters
+        training_dashboard.update_stats({
+            'episodes_completed': 0,
+            'total_episodes': num_episodes,
+            'avg_reward': 0.0,
+            'avg_steps': 0.0,
+            'current_cycle': 1,
+            'total_cycles': cycles,
+            'status': 'Running',
+            'reward_x': [0],
+            'reward_y': [0]
+        })
+    
     # Initialize workers
     workers = []
     for i in range(num_workers):
         worker_display = display_manager if i == display_worker and display_enabled else None
-        worker_stream_port = None if stream_base_port is None else stream_base_port + i
+        
+        # Calculate worker stream port: base_port + worker_id + 1
+        # This reserves base_port for the dashboard
+        worker_stream_port = None
+        if stream_base_port is not None:
+            worker_stream_port = stream_base_port + i + 1
+            if training_dashboard:
+                training_dashboard.add_worker(i, worker_stream_port)
+        
+        # Determine if this worker should record
+        should_record = record and (not display_enabled or i != display_worker)
         
         worker = Worker(
             worker_id=i,
@@ -622,12 +779,16 @@ def main(
             weights=weights,
             level=level,
             display_manager=worker_display,
-            record=record and i != display_worker,  # Record all non-display workers separately
+            record=should_record,  # Record based on display_enabled status
+            display_enabled=display_enabled,  # Pass the display_enabled flag
             stream_port=worker_stream_port,
             debug=debug
         )
         workers.append(worker)
-        print(f"Initialized worker {i}, display: {worker_display is not None}, stream port: {worker_stream_port}")
+        print(f"Initialized worker {i}, display: {worker_display is not None and display_enabled}, record: {should_record}, stream port: {worker_stream_port}")
+    
+    # Initialize task queue
+    task_queue = TaskQueue(total_episodes=num_episodes, min_batch_size=1)
     
     # Results tracking
     results = {
@@ -647,31 +808,63 @@ def main(
     episodes_completed = 0
     if checkpoint:
         try:
+            print(f"Loading checkpoint: {checkpoint}")
             checkpoint_data = torch.load(checkpoint)
-            model.load_state_dict(checkpoint_data['model_state_dict'])
-            optimizer.load_state_dict(checkpoint_data['optimizer_state_dict'])
-            scheduler.load_state_dict(checkpoint_data['scheduler_state_dict'])
-            episodes_completed = checkpoint_data['episodes_completed']
             
-            # Load results
-            if 'results' in checkpoint_data:
-                results = checkpoint_data['results']
+            # Determine the checkpoint format (new or legacy format)
+            if isinstance(checkpoint_data, dict):
+                # New format: {episodes_completed, model_state_dict, optimizer_state_dict, ...}
+                if 'model_state_dict' in checkpoint_data:
+                    model.load_state_dict(checkpoint_data['model_state_dict'])
+                    print("Loaded model state from checkpoint")
+                else:
+                    print("Warning: model_state_dict not found in checkpoint, trying direct load")
+                    # Legacy format or direct model state dict
+                    model.load_state_dict(checkpoint_data)
+                    
+                # Load optimizer state if available
+                if 'optimizer_state_dict' in checkpoint_data:
+                    optimizer.load_state_dict(checkpoint_data['optimizer_state_dict'])
+                    print("Loaded optimizer state from checkpoint")
                 
-            # Load worker states
-            if 'workers' in checkpoint_data['results']:
-                worker_states = checkpoint_data['results']['workers']
-                for i, worker in enumerate(workers):
-                    if i < len(worker_states):
-                        worker.load_state_dict(worker_states[i])
-                        
-            print(f"Resumed training from checkpoint at episode {episodes_completed}")
+                # Load scheduler state if available
+                if 'scheduler_state_dict' in checkpoint_data:
+                    scheduler.load_state_dict(checkpoint_data['scheduler_state_dict'])
+                    print("Loaded scheduler state from checkpoint")
+                
+                # Load episode count if available
+                if 'episodes_completed' in checkpoint_data:
+                    episodes_completed = checkpoint_data['episodes_completed']
+                    print(f"Loaded episode count: {episodes_completed}")
+                
+                # Load results if available
+                if 'results' in checkpoint_data:
+                    results = checkpoint_data['results']
+                    print("Loaded training results from checkpoint")
+                    
+                    # Load worker states if available
+                    if 'workers' in results:
+                        worker_states = results['workers']
+                        for i, worker in enumerate(workers):
+                            if i < len(worker_states):
+                                worker.load_state_dict(worker_states[i])
+                                print(f"Loaded state for worker {i}")
+            else:
+                # Directly use checkpoint data as model state dict
+                model.load_state_dict(checkpoint_data)
+                print("Loaded model state (legacy format)")
+                
+            print(f"Successfully loaded checkpoint at episode {episodes_completed}")
         except Exception as e:
             print(f"Error loading checkpoint: {e}")
             traceback.print_exc()
+            print("Proceeding with fresh model")
     
     # Training loop
     try:
         best_reward = float('-inf')
+        last_checkpoint_episode = 0  # Track last checkpoint episode
+        last_checkpoint_time = time.time()  # Track last checkpoint time
         
         while episodes_completed < num_episodes:
             # Calculate entropy and clip ratio based on cycle progress
@@ -694,38 +887,53 @@ def main(
                     worker.increase_level()
                 print(f"Increased level at episode {episodes_completed}")
             
-            # Determine episodes per worker for this iteration
+            # Initialize task queue for this iteration
             remaining_episodes = num_episodes - episodes_completed
-            episodes_per_worker = max(1, min(10, remaining_episodes // num_workers))
+            task_queue.total_episodes = remaining_episodes  # Ensure total_episodes is set correctly
+            task_queue.remaining = remaining_episodes
+            task_queue.results = []
+            task_queue.initialize()
             
-            # Start all workers
+            # Start all workers with the shared queue
             for worker in workers:
-                worker.start(num_episodes=episodes_per_worker)
+                worker.start_with_queue(task_queue)
             
-            # Collect results from workers
-            all_rewards = []
-            all_steps = []
+            # Monitor progress and display updates
+            last_progress_time = time.time()
+            last_dashboard_update = time.time()
             
-            # Wait for all workers to finish
-            active_workers = len(workers)
-            while active_workers > 0:
-                active_workers = 0
+            while not task_queue.is_complete():
+                time.sleep(0.1)  # Short sleep to prevent CPU spinning
                 
+                # Check if any workers crashed
+                all_alive = False
                 for worker in workers:
-                    # Check if worker is still running
                     if worker.is_alive():
-                        active_workers += 1
-                    
-                    # Check for results
-                    results_data = worker.get_results(timeout=0.01)
-                    if results_data is not None:
-                        rewards, steps = results_data
-                        all_rewards.extend(rewards)
-                        all_steps.extend(steps)
+                        all_alive = True
+                        break
                 
-                # Don't busy-wait
-                if active_workers > 0:
-                    time.sleep(0.1)
+                if not all_alive:
+                    print("All workers stopped unexpectedly")
+                    break
+                
+                # Print progress update periodically
+                current_time = time.time()
+                if current_time - last_progress_time > 5.0:  # Update every 5 seconds
+                    completed, in_progress, remaining = task_queue.get_progress()
+                    print(f"Progress: {completed} completed, {in_progress} in progress, {remaining} remaining")
+                    last_progress_time = current_time
+                    
+                    # Update dashboard periodically with status even if no episodes are complete
+                    if training_dashboard and current_time - last_dashboard_update > 10.0:
+                        training_dashboard.update_stats({
+                            'episodes_completed': episodes_completed + completed,
+                            'status': 'Running',
+                            'in_progress': in_progress
+                        })
+                        last_dashboard_update = current_time
+            
+            # Get collected results
+            all_rewards, all_steps = task_queue.get_results()
             
             # Update episode counter
             episodes_completed += len(all_rewards)
@@ -831,9 +1039,28 @@ def main(
             # Update learning rate
             scheduler.step()
             
-            # Save model periodically
-            if episodes_completed // save_interval > (episodes_completed - len(all_rewards)) // save_interval:
+            # Improved checkpoint logic
+            current_time = time.time()
+            should_checkpoint = False
+            
+            # Check if we've passed a save_interval threshold
+            if episodes_completed >= last_checkpoint_episode + save_interval:
+                should_checkpoint = True
+                
+            # Also ensure we save at least every 30 minutes regardless of episodes
+            if current_time - last_checkpoint_time > 1800:  # 30 minutes
+                should_checkpoint = True
+                
+            if should_checkpoint:
                 checkpoint_path = f'{model_dir}/tetris_ppo_{episodes_completed}.pth'
+                
+                # Wait for all workers to be idle before saving the checkpoint
+                if task_queue.in_progress > 0:
+                    print(f"Waiting for {task_queue.in_progress} tasks to complete before checkpointing...")
+                    while task_queue.in_progress > 0 and time.time() - current_time < 30:
+                        time.sleep(0.5)  # Wait up to 30 seconds for tasks to complete
+                
+                # Now safe to checkpoint
                 torch.save({
                     'episodes_completed': episodes_completed,
                     'model_state_dict': model.state_dict(),
@@ -845,8 +1072,10 @@ def main(
                 # Also save results as JSON for easier analysis
                 with open(f'{model_dir}/training_results.json', 'w') as f:
                     json.dump(results, f)
-                    
-                print(f"Saved checkpoint to {checkpoint_path}")
+                
+                print(f"Saved checkpoint at episode {episodes_completed} to {checkpoint_path}")
+                last_checkpoint_episode = episodes_completed
+                last_checkpoint_time = time.time()
             
             # Print progress
             avg_reward = np.mean(all_rewards) if all_rewards else 0
@@ -863,7 +1092,49 @@ def main(
                     'scheduler_state_dict': scheduler.state_dict(),
                     'results': results
                 }, f'{model_dir}/tetris_ppo_best.pth')
+            
+            # Update dashboard with latest stats
+            if training_dashboard:
+                # Calculate window stats
+                window_size = min(10, len(results['episode_rewards']))
+                recent_rewards = results['episode_rewards'][-window_size:] if results['episode_rewards'] else [0]
+                recent_steps = results['episode_steps'][-window_size:] if results['episode_steps'] else [0]
                 
+                # Prepare data for charts
+                reward_x = list(range(len(results['episode_rewards'])))
+                reward_y = results['episode_rewards']
+                
+                # Use rolling window for smoother chart
+                if len(reward_y) > 10:
+                    smoothed_y = []
+                    window = 10
+                    for i in range(window-1, len(reward_y)):
+                        smoothed_y.append(sum(reward_y[i-window+1:i+1])/window)
+                    reward_y = smoothed_y
+                    reward_x = reward_x[window-1:]
+                
+                # Get metrics data
+                metrics_x = list(range(len(results['policy_losses'])))
+                
+                # Send stats update
+                training_dashboard.update_stats({
+                    'episodes_completed': episodes_completed,
+                    'total_episodes': num_episodes,
+                    'avg_reward': sum(recent_rewards) / len(recent_rewards),
+                    'avg_steps': sum(recent_steps) / len(recent_steps),
+                    'current_cycle': episodes_completed // temp_reset + 1,
+                    'total_cycles': cycles,
+                    'status': 'Running',
+                    'reward_x': reward_x,
+                    'reward_y': reward_y,
+                    'metrics_x': metrics_x,
+                    'metrics_y': {
+                        'policy': results['policy_losses'],
+                        'value': results['value_losses'],
+                        'entropy': results['entropy_losses']
+                    }
+                })
+            
             # Explicit cleanup
             torch.cuda.empty_cache()
         
@@ -879,79 +1150,131 @@ def main(
         with open(f'{model_dir}/training_results.json', 'w') as f:
             json.dump(results, f)
             
+    except KeyboardInterrupt:
+        print("\nTraining interrupted by user. Cleaning up...")
     except Exception as e:
         print(f"Error during training: {e}")
         traceback.print_exc()
     finally:
-        # Cleanup
+        print("Cleaning up resources...")
+        # Stop all workers first - improved cleanup sequence
         for worker in workers:
-            worker.close()
-            
+            try:
+                # First, clear any resources that depend on GLFW
+                if worker.display_manager:
+                    worker.display_manager.running = False
+                worker.stop()
+            except Exception as e:
+                print(f"Error stopping worker: {e}")
+        
+        # Then fully close workers
+        for worker in workers:
+            try:
+                worker.close()
+            except Exception as e:
+                print(f"Error closing worker: {e}")
+        
+        # Safely stop display manager with additional error handling
         if display_manager:
-            display_manager.stop()
+            try:
+                # Ensure running flag is set to False before trying to stop
+                display_manager.running = False
+                display_manager.stop()
+            except Exception as e:
+                print(f"Error stopping display manager: {e}")
+        
+        # Stop the training dashboard
+        if training_dashboard:
+            try:
+                training_dashboard.update_stats({'status': 'Completed'})
+                training_dashboard.stop()
+            except Exception as e:
+                print(f"Error stopping training dashboard: {e}")
+        
+        # Save final model state if training was interrupted
+        try:
+            if episodes_completed > 0:
+                interrupted_path = f'{model_dir}/tetris_ppo_interrupted.pth'
+                torch.save({
+                    'episodes_completed': episodes_completed,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'scheduler_state_dict': scheduler.state_dict(),
+                    'results': results
+                }, interrupted_path)
+                print(f"Saved interrupted training state to {interrupted_path}")
+        except Exception as e:
+            print(f"Error saving interrupted state: {e}")
             
+        # Final cleanup
         torch.cuda.empty_cache()
+        print("Cleanup complete.")
         
     return best_reward
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description='Train PPO on Tetris')
-    parser.add_argument('--num_episodes', type=int, default=1000)
-    parser.add_argument('--batch_size', type=int, default=64)
-    parser.add_argument('--gamma', type=float, default=0.99)
-    parser.add_argument('--lam', type=float, default=0.95)
-    parser.add_argument('--clip_ratio', type=float, default=0.2)
-    parser.add_argument('--target_kl', type=float, default=0.01)
-    parser.add_argument('--value_coef', type=float, default=0.5)
-    parser.add_argument('--entropy_coef', type=float, default=0.1)
-    parser.add_argument('--learning_rate', type=float, default=3e-4)
-    parser.add_argument('--max_moves', type=int, default=100)
-    parser.add_argument('--save_interval', type=int, default=100)
-    parser.add_argument('--weights', type=str, default=None)
-    parser.add_argument('--level', type=int, default=1)
-    parser.add_argument('--level_inc', type=int, default=-1)
-    parser.add_argument('--cycles', type=int, default=1)
-    parser.add_argument('--debug', action='store_true', help='Enable debugging')
-    parser.add_argument('--no_display', dest='display_enabled', action='store_false', default=True)
-    parser.add_argument('--record', action='store_true', help='Record video')
-    parser.add_argument('--num_workers', type=int, default=1, help='Number of parallel workers')
-    parser.add_argument('--display_worker', type=int, default=0, help='Worker ID to display (must be < num_workers)')
-    parser.add_argument('--checkpoint', type=str, default=None, help='Path to checkpoint file for resuming')
-    parser.add_argument('--stream', action='store_true', help='Enable streaming on local ports')
-    parser.add_argument('--stream_base_port', type=int, default=8080, help='Base port for streaming (if enabled)')
-    
-    args = parser.parse_args()
-    
-    # Validate arguments
-    if args.display_worker >= args.num_workers:
-        print(f"Warning: display_worker {args.display_worker} >= num_workers {args.num_workers}, setting to 0")
-        args.display_worker = 0
+    try:
+        parser = argparse.ArgumentParser(description='Train PPO on Tetris')
+        parser.add_argument('--num_episodes', type=int, default=1000)
+        parser.add_argument('--batch_size', type=int, default=64)
+        parser.add_argument('--gamma', type=float, default=0.99)
+        parser.add_argument('--lam', type=float, default=0.95)
+        parser.add_argument('--clip_ratio', type=float, default=0.2)
+        parser.add_argument('--target_kl', type=float, default=0.01)
+        parser.add_argument('--value_coef', type=float, default=0.5)
+        parser.add_argument('--entropy_coef', type=float, default=0.1)
+        parser.add_argument('--learning_rate', type=float, default=3e-4)
+        parser.add_argument('--max_moves', type=int, default=100)
+        parser.add_argument('--save_interval', type=int, default=100)
+        parser.add_argument('--weights', type=str, default=None)
+        parser.add_argument('--level', type=int, default=1)
+        parser.add_argument('--level_inc', type=int, default=-1)
+        parser.add_argument('--cycles', type=int, default=1)
+        parser.add_argument('--debug', action='store_true', help='Enable debugging')
+        parser.add_argument('--no_display', dest='display_enabled', action='store_false', default=True)
+        parser.add_argument('--record', action='store_true', help='Record video')
+        parser.add_argument('--num_workers', type=int, default=1, help='Number of parallel workers')
+        parser.add_argument('--display_worker', type=int, default=0, help='Worker ID to display (must be < num_workers)')
+        parser.add_argument('--checkpoint', type=str, default=None, help='Path to checkpoint file for resuming')
+        parser.add_argument('--stream', action='store_true', help='Enable streaming on local ports')
+        parser.add_argument('--stream_base_port', type=int, default=8080, help='Base port for streaming (if enabled)')
         
-    # Set streaming port if enabled
-    stream_base_port = args.stream_base_port if args.stream else None
-    
-    print(f"Arguments: {args}")
-    main(
-        num_episodes=args.num_episodes,
-        batch_size=args.batch_size,
-        gamma=args.gamma,
-        lam=args.lam,
-        clip_ratio=args.clip_ratio,
-        target_kl=args.target_kl,
-        value_coef=args.value_coef,
-        entropy_coef=args.entropy_coef,
-        learning_rate=args.learning_rate,
-        max_moves=args.max_moves,
-        save_interval=args.save_interval,
-        weights=args.weights,
-        display_enabled=args.display_enabled,
-        record=args.record,
-        level=args.level,
-        level_inc=args.level_inc,
-        cycles=args.cycles,
-        debug=args.debug,
-        num_workers=args.num_workers,
-        display_worker=args.display_worker,
-        checkpoint=args.checkpoint,
-        stream_base_port=stream_base_port
-    )
+        args = parser.parse_args()
+        
+        # Validate arguments
+        if args.display_worker >= args.num_workers:
+            print(f"Warning: display_worker {args.display_worker} >= num_workers {args.num_workers}, setting to 0")
+            args.display_worker = 0
+            
+        # Set streaming port if enabled
+        stream_base_port = args.stream_base_port if args.stream else None
+        
+        print(f"Arguments: {args}")
+        main(
+            num_episodes=args.num_episodes,
+            batch_size=args.batch_size,
+            gamma=args.gamma,
+            lam=args.lam,
+            clip_ratio=args.clip_ratio,
+            target_kl=args.target_kl,
+            value_coef=args.value_coef,
+            entropy_coef=args.entropy_coef,
+            learning_rate=args.learning_rate,
+            max_moves=args.max_moves,
+            save_interval=args.save_interval,
+            weights=args.weights,
+            display_enabled=args.display_enabled,
+            record=args.record,
+            level=args.level,
+            level_inc=args.level_inc,
+            cycles=args.cycles,
+            debug=args.debug,
+            num_workers=args.num_workers,
+            display_worker=args.display_worker,
+            checkpoint=args.checkpoint,
+            stream_base_port=stream_base_port
+        )
+    except KeyboardInterrupt:
+        print("\nProgram terminated by user")
+        # Ensure any resources at the top level are cleaned up
+        torch.cuda.empty_cache()
